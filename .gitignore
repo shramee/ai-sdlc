@@ -1,0 +1,6 @@
+.sdlc/
+*.log
+.DS_Store
+jscpd-report/
+node_modules/
+__pycache__/
