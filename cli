@@ -1,0 +1,896 @@
+#!/usr/bin/env bash
+# ai-sdlc — agentic SDLC orchestration: skills/subagents on top, opencode-in-ag-sbx
+# underneath.
+#
+# This script is the MECHANICS layer only — git/docker/gh plumbing that has no
+# judgment in it. The judgment lives one level up, in .claude/skills/*/SKILL.md
+# (the runbook a Claude Code "main agent" follows) and .claude/agents/reviewer.md
+# (the subagent that gates a merge). Nothing here decides *whether* to dispatch,
+# *what* to ask for, or *whether work is good* — it only does the thing once
+# asked. See README.md for how the three layers fit together.
+#
+# Execution backend: every dispatched worker runs `opencode` inside an
+# https://github.com/shramee/agent-sandbox container, driven by that repo's
+# `ag-sbx` CLI. `ag-sbx` bind-mounts a directory at the *identical path* inside
+# the container as on the host — so unlike a monolithic /workspace mount, a
+# host-created git worktree just works from both sides with no path
+# translation, no container-side worktree surgery, and no dead-.git-pointer
+# class of bug. Keep it that way: create worktrees on the host, cd into them,
+# then hand off to ag-sbx.
+#
+# Usage: cli <subcommand> [args...]
+#
+# Subcommands:
+#   dispatch <repo> <branch> "<prompt>" [extra opencode flags...]
+#       Creates/resumes a HOST git worktree for <branch>, ensures its ag-sbx
+#       container, syncs opencode credentials into it, and runs
+#       `opencode run --auto` there. Tracks a GitHub issue (status:dispatched)
+#       per branch, best-effort. The worker commits locally but never pushes
+#       or opens a PR.
+#
+#   vibe <repo> <branch>
+#       Same worktree/container setup as dispatch, but opens an interactive
+#       `opencode` (or a plain shell) for a human instead of running headless.
+#
+#   review-context <repo> <branch>
+#       Read-only. Prints a bundle (full diff, commit log, tracked issue,
+#       open PR) for the sdlc-review skill to hand to the reviewer subagent.
+#       Never touches git state — safe to run against a branch mid-flight.
+#
+#   quality <repo> [branch]
+#       Runs quality/grade.sh (lizard + jscpd) against <branch> (default:
+#       working tree) and prints a Scrutinizer-style grade. See docs/REVIEW.md
+#       for what the grade means and quality/thresholds.conf for the gate.
+#
+#   ship [branch]
+#       Runs on the HOST (needs `gh` auth). Sweeps local agent branches ahead
+#       of default, runs each repo's test/build command AND the quality gate,
+#       and only if both are green pushes and opens a PR. Failing branches are
+#       left unpushed for a fix-up `dispatch` re-run.
+#
+#   sync [repo ...]
+#       After a PR merges: pulls the repo's default branch. In submodule
+#       projects, also stages and commits the updated pointer in the parent
+#       repo. Defaults to all configured repos.
+#
+#   status
+#       Read-only fleet view: per-repo branch, ahead/behind, local agent
+#       branches, open PRs, and live ag-sbx containers for this project's
+#       worktrees.
+#
+#   checkout <repo> [branch] [--stash|--reset|--wip]
+#       Direct-editing counterpart to dispatch — human/host works the branch
+#       in the host tree instead of a container worker. Creates or resumes
+#       <branch> off the repo's default. Run `cli restore <repo>` when done.
+#       With no <branch>, lists the repo's checkoutable branches and exits.
+#
+#   restore <repo> [--stash|--reset|--wip]
+#       Switch <repo> back to its default branch. Same dirty-tree handling
+#       as checkout.
+#
+#   container <repo> [build|deploy|update|clean|status]
+#       Thin proxy to `ag-sbx` for the given repo's default (non-worktree)
+#       checkout — useful for warming/rebuilding the image. Per-branch
+#       dispatch containers are managed automatically by dispatch/ship.
+#
+#   config
+#       Print the resolved project configuration (paths, repos, image).
+#
+#   init [dir]
+#       Write a starter sdlc.conf into <dir> (default: current directory).
+#
+# Configuration: every subcommand resolves a project by walking up from $PWD
+# (or $SDLC_PROJECT) for an `sdlc.conf` file; $SDLC_CONFIG overrides the
+# search. Run `cli init` to create one, and see the comments in the generated
+# file for every supported knob.
+#
+# Example: cli dispatch core agent/fix-nullifier "fix double-spend edge case"
+set -euo pipefail
+
+export GIT_PAGER=cat PAGER=cat GH_PAGER=cat GIT_EDITOR=true EDITOR=true VISUAL=true
+
+_resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+SDLC_HOME="$(_resolve_self)"
+
+usage() {
+    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SDLC_HOME/cli"
+    exit "${1:-1}"
+}
+
+die() { echo "!! $*" >&2; exit 1; }
+
+# ------------------------------------------------------------- config ------
+find_config() {
+    if [ -n "${SDLC_CONFIG:-}" ]; then
+        [ -f "$SDLC_CONFIG" ] || die "SDLC_CONFIG points at a missing file: $SDLC_CONFIG"
+        echo "$SDLC_CONFIG"
+        return 0
+    fi
+    local dir="${SDLC_PROJECT:-$PWD}"
+    dir="$(cd "$dir" && pwd)"
+    while [ "$dir" != "/" ]; do
+        [ -f "$dir/sdlc.conf" ] && { echo "$dir/sdlc.conf"; return 0; }
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+load_config() {
+    local conf
+    conf="$(find_config)" || die "no sdlc.conf found in $PWD or any parent — run 'cli init' to create one"
+    CONFIG_FILE="$conf"
+    PROJECT_ROOT="$(cd "$(dirname "$conf")" && pwd)"
+
+    PROJECT_NAME="$(basename "$PROJECT_ROOT")"
+    REPOS=(.)
+    AGENT_BRANCH_PREFIX="agent/"
+    # opencode invocation. dispatch appends `--dir "<worktree>" "<prompt>"`
+    # (plus any extra flags passed on the command line); vibe drops --auto.
+    OPENCODE_CMD=(opencode run --auto --format json)
+    OPENCODE_MODEL=""
+    AGENT_GIT_NAME=""
+    AGENT_GIT_EMAIL=""
+    # ag-sbx pulls this image by default. Set AG_SBX_IMAGE_OVERRIDE to build a
+    # project-specific derivative (e.g. via docker/Dockerfile in this repo,
+    # which layers opencode + the quality tools onto shramee/agent-sandbox).
+    AG_SBX_IMAGE_OVERRIDE=""
+    AG_SBX_BIN="ag-sbx"
+    STATE_DIR=""
+    LOGS_DIR=""
+    WORKTREES_DIR=""
+    SUBAGENT_INSTRUCTIONS="$SDLC_HOME/subagent-instructions.md"
+    # shellcheck disable=SC2034
+    unset -f test_cmd_for 2>/dev/null || true
+
+    # shellcheck disable=SC1090
+    source "$conf"
+
+    : "${STATE_DIR:=$PROJECT_ROOT/.sdlc}"
+    [[ "$STATE_DIR" = /* ]] || STATE_DIR="$PROJECT_ROOT/$STATE_DIR"
+    : "${LOGS_DIR:=$STATE_DIR/logs}"
+    : "${WORKTREES_DIR:=$STATE_DIR/worktrees}"
+    [[ "$LOGS_DIR" = /* ]] || LOGS_DIR="$PROJECT_ROOT/$LOGS_DIR"
+    [[ "$WORKTREES_DIR" = /* ]] || WORKTREES_DIR="$PROJECT_ROOT/$WORKTREES_DIR"
+    [[ "$SUBAGENT_INSTRUCTIONS" = /* ]] || SUBAGENT_INSTRUCTIONS="$PROJECT_ROOT/$SUBAGENT_INSTRUCTIONS"
+
+    [ "${#REPOS[@]}" -gt 0 ] || die "$conf defines no REPOS"
+}
+
+# --------------------------------------------------------- repo helpers ----
+repo_dir_of() {
+    if [ "$1" = "." ]; then echo "$PROJECT_ROOT"; else echo "$PROJECT_ROOT/$1"; fi
+}
+
+repo_label_of() {
+    if [ "$1" = "." ]; then echo "$PROJECT_NAME"; else echo "${1//\//-}"; fi
+}
+
+require_repo() {
+    local dir; dir="$(repo_dir_of "$1")"
+    [ -e "$dir/.git" ] || { echo "no such repo (or not initialized): $1" >&2; return 1; }
+    echo "$dir"
+}
+
+default_branch_of() {
+    git -C "$1" remote show origin | sed -n '/HEAD branch/s/.*: //p'
+}
+
+repo_slug_of() {
+    git -C "$1" remote get-url origin | sed -E 's#.*github.com[:/](.*)(\.git)?$#\1#; s#\.git$##'
+}
+
+project_is_superrepo() {
+    [ -e "$PROJECT_ROOT/.git" ] && [ -f "$PROJECT_ROOT/.gitmodules" ]
+}
+
+default_test_cmd() {
+    local dir="$1"
+    if [ -f "$dir/pnpm-lock.yaml" ]; then
+        echo "pnpm install && pnpm test"
+    elif [ -f "$dir/package-lock.json" ] || [ -f "$dir/package.json" ]; then
+        echo "npm install && npm test"
+    elif [ -f "$dir/Cargo.toml" ]; then
+        echo "cargo test"
+    elif [ -f "$dir/go.mod" ]; then
+        echo "go test ./..."
+    elif [ -f "$dir/foundry.toml" ]; then
+        echo "forge test"
+    elif [ -f "$dir/pyproject.toml" ]; then
+        echo "pytest"
+    else
+        echo ""
+    fi
+}
+
+validation_cmd_for() {
+    local repo="$1" dir="$2" cmd=""
+    if declare -F test_cmd_for >/dev/null; then
+        cmd="$(test_cmd_for "$repo" "$dir" || true)"
+    fi
+    [ -n "$cmd" ] || cmd="$(default_test_cmd "$dir")"
+    echo "$cmd"
+}
+
+# Every branch a `checkout` could land on: local heads plus origin branches
+# with no local counterpart yet.
+checkoutable_branches() {
+    local dir="$1"
+    {
+        git -C "$dir" for-each-ref --format='%(refname:short)' refs/heads
+        git -C "$dir" for-each-ref --format='%(refname)' refs/remotes/origin \
+            | sed 's|^refs/remotes/origin/||' | grep -v '^HEAD$' || true
+    } | sort -u | grep -v '^$' || true
+}
+
+pick_branch() {
+    local dir="$1" default_branch="$2" repo="$3"
+    local cur; cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+    local branches; mapfile -t branches < <(checkoutable_branches "$dir")
+
+    echo "branches in $repo (default $default_branch):" >&2
+    local i br marker where ahead
+    for i in "${!branches[@]}"; do
+        br="${branches[$i]}"
+        marker=" "; [ "$br" = "$cur" ] && marker="*"
+        if git -C "$dir" show-ref --verify --quiet "refs/heads/$br"; then
+            where="local"
+            git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$br" && where="local+remote"
+        else
+            where="remote"
+        fi
+        ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
+        printf '  %2d) %s %-40s %-12s %s ahead of %s\n' \
+            "$((i + 1))" "$marker" "$br" "$where" "$ahead" "$default_branch" >&2
+    done
+
+    if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
+        echo "" >&2
+        echo "Pick one with 'cli checkout $repo <branch>', or name a new one to create it off $default_branch." >&2
+        return 0
+    fi
+
+    echo "" >&2
+    local reply
+    read -r -p "Number, or a new branch name (blank to cancel): " reply < /dev/tty || return 0
+    [ -n "$reply" ] || return 0
+
+    if [[ "$reply" =~ ^[0-9]+$ ]]; then
+        [ "$reply" -ge 1 ] && [ "$reply" -le "${#branches[@]}" ] || die "no such option: $reply"
+        echo "${branches[$((reply - 1))]}"
+    else
+        echo "$reply"
+    fi
+}
+
+checkout_or_create() {
+    local dir="$1" branch="$2" default_branch="$3"
+    if git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$dir" checkout "$branch"
+    elif git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        git -C "$dir" checkout -b "$branch" "origin/$branch"
+    else
+        git -C "$dir" checkout -b "$branch" "origin/$default_branch"
+    fi
+}
+
+dirty_mode_flag() {
+    for arg in "$@"; do
+        case "$arg" in
+            --stash) echo stash; return ;;
+            --reset) echo reset; return ;;
+            --wip) echo wip; return ;;
+        esac
+    done
+}
+
+ensure_clean_or_stash() {
+    local dir="$1" mode="${2:-}"
+    [ -n "$(git -C "$dir" status --porcelain)" ] || return 0
+
+    if [ -z "$mode" ]; then
+        if [ -t 0 ] || [ -r /dev/tty ]; then
+            echo "!! $dir has uncommitted changes." >&2
+            git -C "$dir" status --short >&2
+            echo "What should we do with them? [s]tash / [r]eset --hard (discard) / [c]ommit as wip / [a]bort" >&2
+            local choice
+            read -r -p "> " choice < /dev/tty
+            case "$choice" in
+                s|S|"") mode=stash ;;
+                r|R) mode=reset ;;
+                c|C) mode=wip ;;
+                *) echo "Aborted — resolve manually and retry." >&2; exit 1 ;;
+            esac
+        else
+            echo "!! $dir has uncommitted changes and no TTY is attached to ask interactively." >&2
+            git -C "$dir" status --short >&2
+            echo "Re-run with --stash, --reset, or --wip to resolve automatically." >&2
+            exit 1
+        fi
+    fi
+
+    case "$mode" in
+        stash)
+            local msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
+            git -C "$dir" stash push -u -m "$msg" >/dev/null
+            echo "Stashed as: $msg (git -C $dir stash pop to recover)" >&2
+            ;;
+        reset)
+            git -C "$dir" reset --hard >/dev/null
+            git -C "$dir" clean -fd >/dev/null
+            echo "Discarded uncommitted changes in $dir." >&2
+            ;;
+        wip)
+            git -C "$dir" add -A
+            git -C "$dir" commit -m "wip" >/dev/null
+            echo "Committed pending changes as 'wip'." >&2
+            ;;
+        *)
+            echo "!! unknown mode '$mode' — expected stash/reset/wip" >&2
+            exit 1
+            ;;
+    esac
+}
+
+open_terminal() {
+    local title="$1" cmd="$2"
+    local script; script="$(mktemp -t ai-sdlc-open-terminal).sh"
+    { echo "#!/usr/bin/env bash"; echo "$cmd"; } > "$script"
+    chmod +x "$script"
+
+    if [ -n "${TMUX:-}" ]; then
+        tmux new-window -n "$title" "$script; rm -f $script"
+    elif [ "$(uname)" = "Darwin" ]; then
+        osascript -e "tell application \"Terminal\" to do script \"$script; rm -f $script\"" >/dev/null
+    else
+        echo "Run:"; echo ""; echo "  $cmd"; echo ""
+        rm -f "$script"
+    fi
+}
+
+# ------------------------------------------------------------- gh tracking -
+ensure_status_labels() {
+    local slug="$1"
+    gh label create "status:dispatched" -R "$slug" --color fbca04 --force >/dev/null 2>&1 || true
+    gh label create "status:validating" -R "$slug" --color 0e8a16 --force >/dev/null 2>&1 || true
+}
+
+issue_number_for_branch() {
+    local slug="$1" branch="$2"
+    gh issue list -R "$slug" --state open --json number,title \
+        --jq ".[] | select(.title == \"$branch\") | .number" 2>/dev/null | head -n1
+}
+
+ensure_issue_for_run() {
+    local slug="$1" branch="$2" prompt="$3"
+    ensure_status_labels "$slug"
+
+    local issue_num
+    issue_num="$(issue_number_for_branch "$slug" "$branch")"
+
+    if [ -n "$issue_num" ]; then
+        gh issue comment "$issue_num" -R "$slug" --body "Re-dispatched:
+
+$prompt" >/dev/null 2>&1 || true
+        gh issue edit "$issue_num" -R "$slug" \
+            --remove-label "status:validating" --add-label "status:dispatched" \
+            >/dev/null 2>&1 || true
+    else
+        local url
+        url="$(gh issue create -R "$slug" --title "$branch" --body "$prompt" \
+            --label "status:dispatched" 2>/dev/null)" || true
+        issue_num="$(echo "$url" | sed -E 's#.*/issues/([0-9]+)$#\1#')"
+    fi
+
+    echo "$issue_num"
+}
+
+# ------------------------------------------------------------ ag-sbx glue --
+# ag-sbx keys containers off the directory it's run FROM, hashing the exact
+# path. That's the whole trick this design leans on: run it from a host git
+# worktree and the container mounts that worktree at the identical path, so a
+# worktree's .git pointer (an absolute path) resolves the same from both
+# sides. No /workspace translation layer, no container-side worktree
+# creation, no locking against a host-side prune.
+require_ag_sbx() {
+    command -v "$AG_SBX_BIN" >/dev/null 2>&1 \
+        || die "$AG_SBX_BIN not found on PATH — install https://github.com/shramee/agent-sandbox (./install.sh)"
+}
+
+ag_sbx_env() {
+    # Exported once per call site so `ag-sbx` and `docker` subshells see it.
+    [ -n "$AG_SBX_IMAGE_OVERRIDE" ] && export AG_SBX_IMAGE="$AG_SBX_IMAGE_OVERRIDE"
+}
+
+container_name_for_dir() {
+    # Mirror ag-sbx's own naming (sbx-<5 of dirname>-<4 hex of path>) so we can
+    # `docker exec`/`docker cp` against it directly without re-invoking ag-sbx
+    # for every single step of a dispatch.
+    local dir="$1" dname hash
+    dname="$(basename "$dir" | tr -cd 'A-Za-z0-9_.-' | cut -c1-5 | tr 'A-Z' 'a-z')"
+    hash="$(printf '%s' "$dir" | shasum -a 256 | cut -c1-4)"
+    echo "sbx-${dname}-${hash}"
+}
+
+# opencode's auth lives in ~/.local/share/opencode/auth.json (small) next to a
+# multi-GB local db (opencode.db) we must NOT mount or copy wholesale. `ag-sbx`
+# doesn't know about opencode, so rather than fork it, sync just the
+# credential + config files in with `docker cp` after ag-sbx has the
+# container up — works regardless of ag-sbx's own mount set, and never touches
+# the referenced repo.
+sync_opencode_credentials() {
+    local container="$1"
+    local auth="$HOME/.local/share/opencode/auth.json"
+    local cfg="$HOME/.config/opencode/opencode.json"
+    docker exec "$container" mkdir -p /home/agent/.local/share/opencode /home/agent/.config/opencode
+    [ -f "$auth" ] && docker cp "$auth" "$container:/home/agent/.local/share/opencode/auth.json"
+    [ -f "$cfg" ] && docker cp "$cfg" "$container:/home/agent/.config/opencode/opencode.json"
+    docker exec "$container" chown -R agent:agent /home/agent/.local/share/opencode /home/agent/.config/opencode 2>/dev/null || true
+}
+
+# Ensures the ag-sbx container for $1 (a directory) is up, with opencode
+# credentials synced and the agent git identity set. Echoes its container name.
+ensure_worker_container() {
+    local dir="$1"
+    require_ag_sbx
+    ag_sbx_env
+    ( cd "$dir" && "$AG_SBX_BIN" -- true )
+    local container; container="$(container_name_for_dir "$dir")"
+    sync_opencode_credentials "$container"
+    [ -n "$AGENT_GIT_NAME" ] && docker exec "$container" git config --global user.name "$AGENT_GIT_NAME"
+    [ -n "$AGENT_GIT_EMAIL" ] && docker exec "$container" git config --global user.email "$AGENT_GIT_EMAIL"
+    docker exec "$container" git config --global --add safe.directory '*' || true
+    echo "$container"
+}
+
+# ------------------------------------------------------------- dispatch ----
+# Host-side worktree: no container involvement in its creation, so plain git
+# handles staleness/pruning normally. Sets (non-local) WORKTREE, LOG_FILE.
+prepare_worktree() {
+    local REPO="$1" BRANCH="$2"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+    local label; label="$(repo_label_of "$REPO")"
+
+    mkdir -p "$LOGS_DIR" "$WORKTREES_DIR"
+    LOG_FILE="$LOGS_DIR/$label-${BRANCH//\//-}.log"
+    WORKTREE="$WORKTREES_DIR/$label/${BRANCH//\//-}"
+    echo "Logging to $LOG_FILE"
+
+    echo "Fetching $REPO" | tee -a "$LOG_FILE"
+    git -C "$dir" fetch origin 2>&1 | tee -a "$LOG_FILE"
+    local default_branch; default_branch="$(default_branch_of "$dir")"
+
+    if [ -d "$WORKTREE" ] && git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Resuming worktree $WORKTREE" | tee -a "$LOG_FILE"
+    else
+        [ -d "$WORKTREE" ] && { rm -rf "$WORKTREE"; git -C "$dir" worktree prune; }
+        echo "Creating worktree $WORKTREE" | tee -a "$LOG_FILE"
+        if git -C "$dir" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+            git -C "$dir" worktree add "$WORKTREE" "$BRANCH" 2>&1 | tee -a "$LOG_FILE"
+        else
+            git -C "$dir" worktree add -b "$BRANCH" "$WORKTREE" "origin/$default_branch" 2>&1 | tee -a "$LOG_FILE"
+        fi
+    fi
+
+    ln -sf "$LOG_FILE" "$WORKTREE/agent.log"
+    local gitdir; gitdir="$(git -C "$WORKTREE" rev-parse --git-common-dir)"
+    case "$gitdir" in /*) ;; *) gitdir="$WORKTREE/$gitdir" ;; esac
+    mkdir -p "$gitdir/info"
+    grep -qxF "agent.log" "$gitdir/info/exclude" 2>/dev/null || echo "agent.log" >> "$gitdir/info/exclude"
+}
+
+cmd_dispatch() {
+    local USAGE_LINE='usage: cli dispatch <repo> <branch> "<prompt>" [extra opencode flags...]'
+    local REPO="${1:?$USAGE_LINE}"
+    local BRANCH="${2:?$USAGE_LINE}"
+    local PROMPT="${3:?$USAGE_LINE}"
+    shift 3
+
+    local WORKTREE LOG_FILE
+    prepare_worktree "$REPO" "$BRANCH"
+
+    {
+        echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
+        echo "branch: $BRANCH"
+        echo "prompt: $PROMPT"
+        echo "flags: $*"
+        echo "---"
+    } >> "$LOG_FILE"
+
+    local slug issue_num
+    slug="$(repo_slug_of "$(repo_dir_of "$REPO")" 2>/dev/null)" || slug=""
+    if [ -n "$slug" ]; then
+        issue_num="$(ensure_issue_for_run "$slug" "$BRANCH" "$PROMPT")"
+        if [ -n "$issue_num" ]; then
+            echo "Tracking issue: $slug#$issue_num" | tee -a "$LOG_FILE"
+        else
+            echo "!! could not create/find tracking issue for $BRANCH (continuing anyway)" | tee -a "$LOG_FILE"
+        fi
+    fi
+
+    local instructions=""
+    [ -f "$SUBAGENT_INSTRUCTIONS" ] && instructions="$(cat "$SUBAGENT_INSTRUCTIONS")"
+    local FULL_PROMPT="$PROMPT
+
+$instructions"
+
+    local container; container="$(ensure_worker_container "$WORKTREE")"
+
+    local model_flags=()
+    [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
+
+    docker exec -w "$WORKTREE" "$container" \
+        "${OPENCODE_CMD[@]}" "${model_flags[@]}" "$@" --dir "$WORKTREE" -- "$FULL_PROMPT" \
+        2>&1 | tee -a "$LOG_FILE"
+
+    echo "" >> "$LOG_FILE"
+}
+
+cmd_vibe() {
+    local USAGE_LINE="usage: cli vibe <repo> <branch>"
+    local REPO="${1:?$USAGE_LINE}"
+    local BRANCH="${2:?$USAGE_LINE}"
+
+    local WORKTREE LOG_FILE
+    prepare_worktree "$REPO" "$BRANCH"
+    local container; container="$(ensure_worker_container "$WORKTREE")"
+
+    local model_flags=()
+    [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
+
+    local cmd="docker exec -it -w \"$WORKTREE\" $container opencode ${model_flags[*]}"
+    echo "Opening interactive opencode session for $REPO:$BRANCH..."
+    open_terminal "vibe:$REPO/$BRANCH" "$cmd"
+}
+
+# --------------------------------------------------------- review-context --
+cmd_review_context() {
+    local USAGE_LINE="usage: cli review-context <repo> <branch>"
+    local REPO="${1:?$USAGE_LINE}"
+    local BRANCH="${2:?$USAGE_LINE}"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+    local default_branch; default_branch="$(default_branch_of "$dir")"
+    local slug; slug="$(repo_slug_of "$dir")"
+
+    echo "## repo: $REPO ($slug)"
+    echo "## branch: $BRANCH  (base: $default_branch)"
+    echo
+    echo "### commit log"
+    git -C "$dir" log --format='- %h %s' "origin/$default_branch..$BRANCH" 2>/dev/null || echo "(no commits found — is the branch fetched?)"
+    echo
+    echo "### full diff"
+    echo '```diff'
+    git -C "$dir" diff "origin/$default_branch...$BRANCH" 2>/dev/null || echo "(diff unavailable)"
+    echo '```'
+    echo
+    local issue_num; issue_num="$(issue_number_for_branch "$slug" "$BRANCH" 2>/dev/null || true)"
+    if [ -n "$issue_num" ]; then
+        echo "### tracking issue #$issue_num"
+        gh issue view "$issue_num" -R "$slug" --json title,body,comments \
+            --jq '"title: " + .title + "\n\n" + .body + "\n\n---comments---\n" + (.comments | map(.body) | join("\n---\n"))' 2>/dev/null || true
+    fi
+    echo
+    local pr_num
+    pr_num="$(gh pr list -R "$slug" --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || true)"
+    if [ -n "$pr_num" ]; then
+        echo "### open PR #$pr_num — implementer's claims"
+        gh pr view "$pr_num" -R "$slug" --comments 2>/dev/null || true
+    fi
+}
+
+# ------------------------------------------------------------- quality ----
+cmd_quality() {
+    local USAGE_LINE="usage: cli quality <repo> [branch]"
+    local REPO="${1:?$USAGE_LINE}"
+    local BRANCH="${2:-}"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+    local thresholds="$PROJECT_ROOT/quality/thresholds.conf"
+    [ -f "$thresholds" ] || thresholds="$SDLC_HOME/quality/thresholds.conf"
+    "$SDLC_HOME/quality/grade.sh" "$dir" "$BRANCH" "$thresholds"
+}
+
+# ----------------------------------------------------------------- ship ----
+cmd_ship() {
+    local FILTER_BRANCH="${1:-}"
+
+    ship_one() {
+        local dir="$1" br="$2" default_branch="$3" repo="$4"
+        git -C "$dir" checkout "$br" || return 1
+
+        local cmd
+        cmd="$(validation_cmd_for "$repo" "$dir")"
+        if [ -z "$cmd" ]; then
+            echo "!! no validation command for $repo — define test_cmd_for in $CONFIG_FILE"
+            return 1
+        fi
+        echo "-- validating: $cmd"
+        if ! (cd "$dir" && eval "$cmd"); then
+            echo "!! validation failed for $repo:$br — not pushing"
+            return 1
+        fi
+
+        echo "-- quality gate"
+        if ! "$SDLC_HOME/quality/grade.sh" "$dir" "$br" "${PROJECT_ROOT}/quality/thresholds.conf" 2>/dev/null \
+            && ! "$SDLC_HOME/quality/grade.sh" "$dir" "$br" "$SDLC_HOME/quality/thresholds.conf"; then
+            echo "!! quality gate failed for $repo:$br — not pushing (see docs/REVIEW.md)"
+            return 1
+        fi
+
+        echo "-- validation + quality passed, pushing and opening PR"
+        git -C "$dir" push -u origin "$br" || return 1
+
+        local slug body
+        slug="$(repo_slug_of "$dir")"
+        body="$(git -C "$dir" log --format='- %s' "origin/$default_branch..$br")"
+
+        local issue_num
+        issue_num="$(issue_number_for_branch "$slug" "$br")"
+        if [ -n "$issue_num" ]; then
+            body="$body
+
+Closes #$issue_num"
+            gh issue edit "$issue_num" -R "$slug" \
+                --remove-label "status:dispatched" --add-label "status:validating" \
+                >/dev/null 2>&1 || true
+        fi
+
+        local pr_out
+        if ! pr_out="$(gh -R "$slug" pr create --head "$br" --base "$default_branch" \
+            --title "$br" --body "$body" 2>&1)"; then
+            case "$pr_out" in
+                *"already exists"*)
+                    echo "-- pushed; PR already open:"
+                    echo "$pr_out" | grep -o 'https://[^ ]*' | tail -1
+                    return 0
+                    ;;
+                *) echo "$pr_out" >&2; return 1 ;;
+            esac
+        fi
+        echo "$pr_out"
+    }
+
+    for repo in "${REPOS[@]}"; do
+        local dir; dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
+
+        local default_branch orig_branch
+        default_branch="$(default_branch_of "$dir")"
+        orig_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+
+        local branches=()
+        while IFS= read -r line; do branches+=("$line"); done \
+            < <(git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX")
+
+        for br in ${branches+"${branches[@]}"}; do
+            [ -z "$br" ] && continue
+            if [ -n "$FILTER_BRANCH" ] && [ "$br" != "$FILTER_BRANCH" ]; then
+                continue
+            fi
+
+            local ahead
+            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
+            [ "$ahead" -eq 0 ] && continue
+
+            echo "== $repo : $br ($ahead commit(s) ahead of $default_branch) =="
+            if ! ship_one "$dir" "$br" "$default_branch" "$repo"; then
+                echo "!! failed for $repo:$br (checkout/validate/quality/push/PR) — not proceeding further on this branch"
+            fi
+
+            git -C "$dir" checkout "$orig_branch" \
+                || echo "!! could not restore $repo to $orig_branch — left on whatever ship_one last checked out"
+        done
+    done
+}
+
+# ----------------------------------------------------------------- sync ----
+cmd_sync() {
+    local repos=("$@")
+    [ "${#repos[@]}" -eq 0 ] && repos=("${REPOS[@]}")
+
+    sync_one() {
+        local dir="$1" default_branch="$2"
+        git -C "$dir" checkout "$default_branch"
+        git -C "$dir" pull --ff-only origin "$default_branch"
+    }
+
+    local updated=()
+
+    for repo in "${repos[@]}"; do
+        local dir; dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
+
+        local default_branch orig_branch before after
+        default_branch="$(default_branch_of "$dir")"
+        orig_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+        before="$(git -C "$dir" rev-parse HEAD)"
+
+        if ! sync_one "$dir" "$default_branch"; then
+            echo "!! sync failed for $repo — skipping"
+            git -C "$dir" checkout "$orig_branch" || echo "!! could not restore $repo to $orig_branch"
+            continue
+        fi
+
+        after="$(git -C "$dir" rev-parse HEAD)"
+        if [ "$before" != "$after" ]; then
+            echo "$repo: $before -> $after"
+            if project_is_superrepo && [ "$repo" != "." ]; then
+                git -C "$PROJECT_ROOT" add "$repo"
+                updated+=("$repo")
+            fi
+        fi
+    done
+
+    if [ "${#updated[@]}" -eq 0 ]; then
+        echo "No parent-repo pointers to update."
+        return 0
+    fi
+
+    git -C "$PROJECT_ROOT" commit -m "chore: sync ${updated[*]} to latest upstream"
+    echo "Committed parent repo update for: ${updated[*]}"
+    echo "Review with 'git show', then push manually when ready."
+}
+
+# ------------------------------------------------------------- checkout ----
+cmd_checkout() {
+    local USAGE_LINE="usage: cli checkout <repo> [branch] [--stash|--reset|--wip]"
+    local REPO="${1:?$USAGE_LINE}"
+    local BRANCH="${2:-}"
+    case "$BRANCH" in --*) BRANCH="" ;; esac
+    local mode; mode="$(dirty_mode_flag "${@:2}")"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+
+    git -C "$dir" fetch origin
+    local default_branch; default_branch="$(default_branch_of "$dir")"
+
+    if [ -z "$BRANCH" ]; then
+        BRANCH="$(pick_branch "$dir" "$default_branch" "$REPO")"
+        [ -n "$BRANCH" ] || { echo "Nothing selected." >&2; return 0; }
+    fi
+
+    ensure_clean_or_stash "$dir" "$mode"
+    checkout_or_create "$dir" "$BRANCH" "$default_branch"
+
+    echo ""
+    echo "$REPO is now on $BRANCH (created/resumed off $default_branch) for direct work"
+    echo "on the host — no container worker dispatched."
+    echo "Follow $SUBAGENT_INSTRUCTIONS: stage everything (git add .) and"
+    echo "commit early and often as steps complete."
+    echo "Run 'cli restore $REPO' when done; a later 'cli dispatch' on this"
+    echo "branch picks up whatever was committed here."
+
+    open_terminal "checkout:$REPO/$BRANCH" "cd \"$dir\" && exec \"\${SHELL:-bash}\" -l"
+}
+
+cmd_restore() {
+    local USAGE_LINE="usage: cli restore <repo> [--stash|--reset|--wip]"
+    local REPO="${1:?$USAGE_LINE}"
+    local mode; mode="$(dirty_mode_flag "${@:2}")"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+
+    ensure_clean_or_stash "$dir" "$mode"
+
+    local default_branch
+    default_branch="$(default_branch_of "$dir")"
+    git -C "$dir" checkout "$default_branch"
+    echo "$REPO restored to $default_branch"
+}
+
+# ---------------------------------------------------------------- container
+cmd_container() {
+    local USAGE_LINE="usage: cli container <repo> [build|deploy|update|clean|status]"
+    local REPO="${1:?$USAGE_LINE}"
+    local ACTION="${2:-status}"
+    local dir; dir="$(require_repo "$REPO")" || exit 1
+    require_ag_sbx
+    ag_sbx_env
+    case "$ACTION" in
+        status)
+            local container; container="$(container_name_for_dir "$dir")"
+            docker ps -a --filter "name=^${container}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+            ;;
+        build|deploy|update|clean)
+            ( cd "$dir" && "$AG_SBX_BIN" "$ACTION" )
+            ;;
+        *) die "usage: $USAGE_LINE" ;;
+    esac
+}
+
+# --------------------------------------------------------------- status ----
+cmd_status() {
+    for repo in "${REPOS[@]}"; do
+        local dir; dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || { echo "== $repo: not initialized =="; continue; }
+
+        local default_branch cur dirty
+        default_branch="$(default_branch_of "$dir")"
+        cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+        dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
+
+        echo "== $repo (on $cur, default $default_branch, $dirty dirty file(s)) =="
+
+        git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX" | while read -r br; do
+            [ -z "$br" ] && continue
+            local ahead
+            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
+            local label; label="$(repo_label_of "$repo")"
+            local wt="$WORKTREES_DIR/$label/${br//\//-}"
+            local live=""
+            if [ -d "$wt" ]; then
+                local cname; cname="$(container_name_for_dir "$wt")"
+                docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cname" && live=" [container: $cname running]"
+            fi
+            echo "  branch $br: $ahead commit(s) ahead of $default_branch$live"
+        done
+
+        local slug
+        slug="$(repo_slug_of "$dir")"
+        gh -R "$slug" pr list --json number,title,headRefName,state \
+            --template '{{range .}}  PR #{{.number}} [{{.state}}] {{.headRefName}}: {{.title}}\n{{end}}' 2>/dev/null || echo "  (could not list PRs)"
+    done
+}
+
+# --------------------------------------------------------------- config ----
+cmd_config() {
+    cat <<EOF
+config file : $CONFIG_FILE
+project     : $PROJECT_NAME
+project root: $PROJECT_ROOT
+repos       : ${REPOS[*]}
+branch prefix: $AGENT_BRANCH_PREFIX
+opencode cmd: ${OPENCODE_CMD[*]} ${OPENCODE_MODEL:+--model $OPENCODE_MODEL}
+ag-sbx bin  : $AG_SBX_BIN $([ -n "$AG_SBX_IMAGE_OVERRIDE" ] && echo "(AG_SBX_IMAGE=$AG_SBX_IMAGE_OVERRIDE)" || echo "(default image)")
+logs        : $LOGS_DIR
+worktrees   : $WORKTREES_DIR
+instructions: $SUBAGENT_INSTRUCTIONS
+superrepo   : $(project_is_superrepo && echo yes || echo no)
+EOF
+    local repo dir
+    for repo in "${REPOS[@]}"; do
+        dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || { echo "  $repo: (not initialized)"; continue; }
+        echo "  $repo: $(validation_cmd_for "$repo" "$dir")"
+    done
+}
+
+# ----------------------------------------------------------------- init ----
+cmd_init() {
+    local target="${1:-$PWD}"
+    target="$(cd "$target" && pwd)"
+    local conf="$target/sdlc.conf"
+    [ -e "$conf" ] && die "$conf already exists"
+    cp "$SDLC_HOME/examples/sdlc.conf.example" "$conf"
+    echo "Wrote $conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE, then run 'cli config'."
+}
+
+# ----------------------------------------------------------------- main ----
+[ $# -eq 0 ] && usage
+SUBCOMMAND="$1"; shift
+
+case "$SUBCOMMAND" in
+    -h|--help|help) usage 0 ;;
+    init) cmd_init "$@"; exit 0 ;;
+esac
+
+load_config
+
+case "$SUBCOMMAND" in
+    dispatch)       cmd_dispatch "$@" ;;
+    vibe)           cmd_vibe "$@" ;;
+    review-context) cmd_review_context "$@" ;;
+    quality)        cmd_quality "$@" ;;
+    ship)           cmd_ship "$@" ;;
+    sync)           cmd_sync "$@" ;;
+    status)         cmd_status "$@" ;;
+    checkout)       cmd_checkout "$@" ;;
+    restore)        cmd_restore "$@" ;;
+    container)      cmd_container "$@" ;;
+    config)         cmd_config "$@" ;;
+    *) echo "unknown subcommand: $SUBCOMMAND" >&2; usage ;;
+esac
