@@ -1,0 +1,59 @@
+# ai-sdlc project configuration — sourced as bash by the `cli` tool.
+#
+# Its location defines the project root: every path below is relative to the
+# directory holding this file, and `cli` finds it by walking up from $PWD.
+# Everything here is optional; the defaults shown are what you get if you
+# delete a line.
+
+# Name used for log/state paths. Default: project dir name.
+# PROJECT_NAME="myproject"
+
+# Repos the fleet works across, as paths relative to the project root. Use
+# `.` for a plain single-repo project; list submodule paths for a
+# monorepo-of-repos. Default: (.)
+REPOS=(.)
+
+# Branch prefix that marks a branch as agent work — `ship` and `status` only
+# ever look at branches under it. Default: "agent/"
+# AGENT_BRANCH_PREFIX="agent/"
+
+# The opencode invocation, as an argv array (before the repo/model flags
+# `dispatch` appends). Default: (opencode run --auto --format json)
+# OPENCODE_CMD=(opencode run --auto --format json)
+
+# Model override, passed as `opencode run --model <value>`. Leave unset to
+# use opencode's own default/configured model.
+# OPENCODE_MODEL="anthropic/claude-sonnet-5"
+
+# Commit identity for work done inside the sandbox. Scoped to the container
+# only — never touches the host's git config.
+# AGENT_GIT_NAME="myproject-bot"
+# AGENT_GIT_EMAIL="bot@users.noreply.github.com"
+
+# ag-sbx (https://github.com/shramee/agent-sandbox) must be installed and on
+# PATH. It pulls shramee/agent-sandbox:latest by default, which does NOT
+# include opencode — point AG_SBX_IMAGE_OVERRIDE at a derivative image built
+# from docker/Dockerfile in this repo (FROM shramee/agent-sandbox + opencode +
+# the quality tools) before dispatching anything.
+# AG_SBX_IMAGE_OVERRIDE="yourorg/ai-sdlc-sandbox:latest"
+# AG_SBX_BIN="ag-sbx"
+
+# Where logs and host-side worktrees live. Default: <project>/.sdlc/{logs,worktrees}
+# STATE_DIR=".sdlc"
+
+# Extra instructions appended to every dispatched prompt. Default: this
+# repo's own subagent-instructions.md (reuse-first mandate, commit hygiene,
+# agent.log discipline, "a passing test is not evidence").
+# SUBAGENT_INSTRUCTIONS="sdlc/subagent-instructions.md"
+
+# Validation gate for `ship` — the command that must pass (alongside the
+# quality gate in quality/thresholds.conf) before a branch is pushed and a PR
+# opened. Called as test_cmd_for <repo> <abs-dir>; echo the command to run
+# inside that repo, or nothing to fall back to autodetection
+# (pnpm/npm/cargo/go/forge/pytest).
+# test_cmd_for() {
+#     case "$1" in
+#         api)      echo "cargo test" ;;
+#         web)      echo "pnpm install && pnpm run lint && pnpm run build" ;;
+#     esac
+# }
