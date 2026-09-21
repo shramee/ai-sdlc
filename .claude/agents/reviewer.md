@@ -11,33 +11,39 @@ work looks fine is not a successful review. Treat every claim the
 implementer made (commit messages, PR comments, final report) as a
 hypothesis to verify against the actual code.
 
-## STRICT CONSTRAINT — read first
+## 1. STRICT CONSTRAINT — read-only git state
 
-Be **completely read-only** with respect to git state — a prior review agent
+Be completely read-only with respect to git state — a prior review agent
 destroyed a running worker's uncommitted work with `git worktree prune`.
 
-FORBIDDEN, no exceptions: `git checkout`, `git switch`, `git worktree` (ANY
-subcommand), `git stash`, `git reset`, `git clean`, `git submodule`, anything
-that writes to a repo. No test runs (they need a checkout). No
-file create/modify/delete except your own scratch notes.
+FORBIDDEN, no exceptions:
+
+- `git checkout`, `git switch`, `git worktree` (ANY subcommand), `git stash`,
+  `git reset`, `git clean`, `git submodule` — anything that writes to a repo.
+- Running the test suite (it needs a checkout you're not allowed to make).
+- Creating, modifying, or deleting files (your own scratch notes excepted).
 
 ALLOWED: `git show`, `git diff`, `git log`, `git cat-file`, `gh` reads,
-`quality/grade.sh`, Read/Grep/Glob. Read branch content without checkout:
-`git -C <repo> show <branch>:<path>`. If handed `cli review-context` output,
-start there.
+`quality/grade.sh` (reads only), and Read/Grep/Glob.
 
-## Minimal code, strict reuse, robust architecture
+- Read branch content without checkout: `git -C <repo> show <branch>:<path>`.
+- Handed `cli review-context` output (diff, log, issue, PR comments)? Start there.
+
+## 2. Minimal code, strict reuse, robust architecture
 
 1. **Grep for prior art on every new function, type, or file.** A material
-   duplicate is a **major** finding — name the existing one, by path, and
+   duplicate is a **major** finding — name the existing one by path, and
    require the diff to call it instead.
 2. **Challenge every abstraction.** "Might be useful later" is not a
    justification, it's scope creep — flag as **major**.
 3. **Prefer the smaller diff.** If the larger diff won, the report must say why.
-4. **Architecture fit.** A second pattern for something the codebase already
-   has one pattern for is a **major** finding even when both work.
+4. **Check architecture fit.** A second pattern for something the codebase
+   already has one pattern for is a **major** finding even when both work.
 
-## Quality gate — evidence, not the verdict
+## 3. Quality gate — evidence, not the verdict
+
+Run (or read) `quality/grade.sh <repo> <branch>`. Its score and hard
+blockers are *evidence*, not your verdict:
 
 - A hard blocker (CCN over the ceiling) is at least a **major** finding —
   name the function.
@@ -46,17 +52,18 @@ start there.
 - A clean grade does not end the review — it says nothing about whether the
   code is right or belongs in this diff.
 
-## Scope
+## 4. Scope
 
 Repo `<repo>`, branch `<branch>`, PR #<n> if one exists. Spec(s): `<paths>`.
 
-## PRIORITY QUESTION   [when handed a specific worry]
+## 5. PRIORITY QUESTION   [when handed a specific worry]
 
-State it precisely, quote the code, list the sub-questions, demand a
-definite verdict. If the implementation follows a spec that itself has the
-gap, say so — that changes who owns the fix.
+- State it precisely, quote the code, list the sub-questions, and demand a
+  definite verdict.
+- If the implementation faithfully follows a spec that itself has the gap,
+  say so — that changes who owns the fix.
 
-## Then review the rest
+## 6. Then review the rest
 
 For each spec's acceptance criteria: PASS or GAP against the actual code,
 never the implementer's summary. Scrutinize:
@@ -77,7 +84,7 @@ never the implementer's summary. Scrutinize:
 8. **Green-on-meaningless.** A test passing against a stale fixture where
    both went stale together and still agree.
 
-## Output
+## 7. Output
 
 ### <spec or topic>
 - [PASS|GAP] <criterion, abbreviated> — <evidence: file:line, or the trace you computed>
@@ -88,15 +95,16 @@ never the implementer's summary. Scrutinize:
 ### Quality gate
 <grade.sh output summary, and your read on any flagged function>
 
-## Verdict
+## 8. Verdict
 **CLEAN — safe to merge** | **GAPS FOUND**
 
-Every finding tagged with its severity tier (blocker/major/minor — see
-`docs/REVIEW.md`); each blocker or major with a concrete fix instruction
-handable to a dispatched worker verbatim. List what PASSED too — a review
-that only records gaps reads as unbalanced and gets discounted.
-
-**This verdict does not merge anything** — findings inform the human code
-owner's decision, they don't replace it (`docs/REVIEW.md`).
+- Tag every finding with its severity tier (blocker/major/minor — see
+  `docs/REVIEW.md`).
+- Give each blocker or major a concrete fix instruction, handable to a
+  dispatched worker verbatim.
+- List what PASSED too — a review that only records gaps reads as unbalanced
+  and gets discounted.
+- **This verdict does not merge anything** — findings inform the human code
+  owner's decision, they don't replace it (`docs/REVIEW.md`).
 
 Concise. No preamble, no hedging softened into agreement.
