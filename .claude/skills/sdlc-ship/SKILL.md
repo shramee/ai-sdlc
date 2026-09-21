@@ -9,30 +9,24 @@ description: Validate and ship a dispatched branch with `cli ship` — tests, th
 cli ship agent/<slug>
 ```
 
-Runs on the host, needs `gh` auth. Checks out the branch, runs the repo's
-`test_cmd_for` command, then the quality gate (`quality/grade.sh` against
-`quality/thresholds.conf`) — only pushes and opens/updates a PR if **both**
-are green. First ship opens the PR; later ships push onto it (`pr create`
-returning "already exists" is the normal resume path, not an error).
+Runs on the host, needs `gh` auth. Runs the repo's `test_cmd_for` command
+and the quality gate; pushes and opens/updates a PR only if **both** are
+green. First ship opens the PR; later ships push onto it ("already exists"
+is the normal resume path, not an error).
 
 ## If it fails
 
-**Do not fix it yourself, even a one-line fix.** The orchestrating session
-orchestrates; it doesn't patch code — the one sanctioned exception is
-explicit `cli checkout` direct-editing mode (see
-[`sdlc-checkout`](../sdlc-checkout/SKILL.md)), entered deliberately, not as a
-shortcut around a failed ship. Re-dispatch on the same branch instead, with
-the failure output as the prompt — see
-[`sdlc-dispatch`](../sdlc-dispatch/SKILL.md)'s "resuming a branch" section.
+**Do not fix it yourself, even a one-line fix** — re-dispatch on the same
+branch with the failure output as the prompt (see
+[`sdlc-dispatch`](../sdlc-dispatch/SKILL.md)'s "resuming a branch"). The one
+sanctioned exception is `sdlc-checkout` direct-edit mode, entered
+deliberately and announced — never as a shortcut around a failed ship.
 
 A quality-gate failure is not a false alarm to route around: read
-`docs/REVIEW.md` for what the score means, then dispatch the fix it implies
-(usually: reuse the thing it flagged as duplicated, or break up the
-function it flagged as too complex).
+`docs/REVIEW.md` for what the score means, then dispatch the fix it implies.
 
 ## Once it's pushed
 
-A PR now exists. Do not merge it yet — hand off to
-[`sdlc-review`](../sdlc-review/SKILL.md). `cli ship` pushing green is a
-necessary gate, not the review itself; `docs/REVIEW.md` is explicit that
-tests-passing and quality-gate-passing don't self-approve a merge.
+Do not merge yet — hand off to [`sdlc-review`](../sdlc-review/SKILL.md).
+Green `cli ship` is a necessary gate, not the review; tests-passing doesn't
+self-approve a merge (`docs/REVIEW.md`).
