@@ -6,12 +6,11 @@ workers into [`ag-sbx`](https://github.com/shramee/agent-sandbox) containers**,
 gates every merge with an aggressive read-only reviewer subagent, and grades
 code quality with self-hosted tooling instead of a SaaS dashboard.
 
-Extracted from a working, single-project bash tool (`sdlc/cli`, driving
-Claude Code directly in a bespoke container) into something repo-agnostic and
-layered, and re-armed against
-[Anthropic's AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook)
-to fill the gaps that tool never had time to cover — see `docs/PLAYBOOK.md`
-for exactly what maps where and what's still missing.
+Repo-agnostic by design — point it at any project via `sdlc.conf` — and
+mapped explicitly against
+[Anthropic's AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook):
+see `docs/PLAYBOOK.md` for which stage each piece covers and what's
+deliberately left out for later.
 
 ## The three layers
 
@@ -96,16 +95,18 @@ The underlying commands, if you want the mechanics directly:
 | `cli container <repo> [build\|deploy\|update\|clean\|status]` | Proxy to `ag-sbx` |
 | `cli config` / `cli init` | Print / write `sdlc.conf` |
 
-## Why `ag-sbx` changes the worktree story
+## Why worktrees live on the host
 
-The original tool created worktrees *inside* the container's own filesystem,
-because its container mounted the whole project at a single `/workspace` path
-unrelated to the host layout — so a worktree's `.git` pointer (an absolute
-path baked in at creation) only resolved from one side, and every prune/lock
-dance existed to keep the host and container from fighting over it.
+A container that mounts the whole project at one fixed path (e.g.
+`/workspace`) unrelated to the host layout forces worktrees to be created
+*inside* the container's own filesystem — a worktree's `.git` pointer is an
+absolute path baked in at creation, so it only resolves from the side that
+created it, and keeping host and container from fighting over the same
+worktree needs its own prune/lock machinery.
 
-`ag-sbx` mounts a directory at the **identical path** inside the container as
-on the host. So worktrees now live on the host, created with plain
+`ag-sbx` sidesteps this: it mounts a directory at the **identical path**
+inside the container as on the host. So worktrees live on the host, created
+with plain
 `git worktree add`, and the container `cd`s into the same path — the `.git`
 pointer just works from both sides. No container-side worktree surgery, no
 locking against a host-side prune, no dead-pointer class of bug. See the
@@ -127,10 +128,10 @@ like Scrutinizer CI graded — no SaaS account, runs the same in CI, in
 
 The reviewer subagent (`.claude/agents/reviewer.md`) is deliberately
 adversarial: it hunts for duplicated logic, unjustified abstractions,
-architecture drift, and the specific defect classes (vacuous tests, weaker-
-than-spec assertions, scope leakage) that have shipped in projects this was
-extracted from. Its verdict is evidence for a human code owner, never a
-merge decision by itself — full policy, severity tiers, and the tag-based
+architecture drift, and specific defect classes that LLM-authored code and
+tests are prone to (vacuous tests, weaker-than-spec assertions, scope
+leakage). Its verdict is evidence for a human code owner, never a merge
+decision by itself — full policy, severity tiers, and the tag-based
 remediation flow in `docs/REVIEW.md`.
 
 ## Layout

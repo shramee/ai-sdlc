@@ -56,8 +56,7 @@ exception for writing code directly instead of dispatching).
 - `bash -n cli` after every edit to the mechanics layer; `cli config` in a
   real consuming project is the cheapest end-to-end smoke test.
 - Nothing project-specific belongs in `cli` — it all comes from `sdlc.conf`
-  with a sane default, same convention the original `sdlc` tool this was
-  extracted from used. A change that needs a project-specific branch needs
+  with a sane default. A change that needs a project-specific branch needs
   a new config knob instead.
 - `quality/grade.sh . "" quality/thresholds.conf` should stay green here —
   this repo eats its own quality gate.
