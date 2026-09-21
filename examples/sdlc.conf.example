@@ -42,8 +42,8 @@ REPOS=(.)
 # STATE_DIR=".sdlc"
 
 # Extra instructions appended to every dispatched prompt. Default: this
-# repo's own subagent-instructions.md (reuse-first mandate, commit hygiene,
-# agent.log discipline, "a passing test is not evidence").
+# repo's own subagent-instructions.md (worker behavior: reuse, commits,
+# mutation checks, agent.log).
 # SUBAGENT_INSTRUCTIONS="sdlc/subagent-instructions.md"
 
 # Validation gate for `ship` — the command that must pass (alongside the

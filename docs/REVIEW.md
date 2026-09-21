@@ -23,8 +23,8 @@ Every finding gets one tier, stated explicitly — never "found some issues":
 | **Major** | Works, but violates the minimal-code/reuse mandate or the quality gate in a way that will cost the next person real time. | A new helper duplicating an existing one; a function over `HARD_MAX_CCN`. |
 | **Minor** | Worth fixing, doesn't block. | A confusing name; a non-yet-costly missed reuse. |
 
-The reviewer's full defect-class list lives in `.claude/agents/reviewer.md`.
-Its quality-gate read ("evidence, not the verdict") is there too.
+The reviewer's full defect-class list and its quality-gate read live in
+`.claude/agents/reviewer.md`.
 
 ## Tag-based fixes
 

@@ -12,10 +12,10 @@ git clone https://github.com/shramee/agent-sandbox ~/www/agent-sandbox
 `ag-sbx` pulls `shramee/agent-sandbox:latest` by default and gives every
 directory you run it from its own container, bind-mounted at the *identical
 path* inside as out — which is exactly what `cli`'s host-side worktree model
-in `cli`'s `prepare_worktree`/`ensure_worker_container` leans on: a worktree's
-`.git` pointer is an absolute path, and because ag-sbx doesn't translate paths
-the way a monolithic `/workspace` mount would, that pointer resolves the same
-from both sides with no container-side worktree surgery.
+(`prepare_worktree`/`ensure_worker_container`) leans on: a worktree's
+`.git` pointer is an absolute path, and because ag-sbx doesn't translate
+paths the way a monolithic `/workspace` mount would, that pointer resolves
+the same from both sides with no container-side worktree surgery.
 
 ## Why this repo has its own Dockerfile
 
