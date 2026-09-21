@@ -1,88 +1,44 @@
 #!/usr/bin/env bash
-# ai-sdlc — agentic SDLC orchestration: skills/subagents on top, opencode-in-ag-sbx
-# underneath.
+# ai-sdlc — the MECHANICS layer: git/docker/gh plumbing + the quality gate.
+# No judgment — that lives in .claude/skills/*/SKILL.md (process) and
+# .claude/agents/reviewer.md (code). See README.md.
 #
-# This script is the MECHANICS layer only — git/docker/gh plumbing that has no
-# judgment in it. The judgment lives one level up, in .claude/skills/*/SKILL.md
-# (the runbook a Claude Code "main agent" follows) and .claude/agents/reviewer.md
-# (the subagent that gates a merge). Nothing here decides *whether* to dispatch,
-# *what* to ask for, or *whether work is good* — it only does the thing once
-# asked. See README.md for how the three layers fit together.
-#
-# Execution backend: every dispatched worker runs `opencode` inside an
-# https://github.com/shramee/agent-sandbox container, driven by that repo's
-# `ag-sbx` CLI. `ag-sbx` bind-mounts a directory at the *identical path* inside
-# the container as on the host — so unlike a monolithic /workspace mount, a
-# host-created git worktree just works from both sides with no path
-# translation, no container-side worktree surgery, and no dead-.git-pointer
-# class of bug. Keep it that way: create worktrees on the host, cd into them,
-# then hand off to ag-sbx.
+# Backend: workers run `opencode` inside an
+# https://github.com/shramee/agent-sandbox container via `ag-sbx`, which
+# bind-mounts directories at the identical path as on the host — so
+# host-created git worktrees resolve from both sides. Create worktrees on the
+# host, cd into them, hand off to ag-sbx. See docker/README.md.
 #
 # Usage: cli <subcommand> [args...]
 #
-# Subcommands:
 #   dispatch <repo> <branch> "<prompt>" [extra opencode flags...]
-#       Creates/resumes a HOST git worktree for <branch>, ensures its ag-sbx
-#       container, syncs opencode credentials into it, and runs
-#       `opencode run --auto` there. Tracks a GitHub issue (status:dispatched)
-#       per branch, best-effort. The worker commits locally but never pushes
-#       or opens a PR.
-#
+#       Host worktree for <branch> + ag-sbx container + `opencode run --auto`
+#       with subagent-instructions.md appended. Tracks a GitHub issue
+#       (status:dispatched), best-effort. Worker commits locally; never pushes.
 #   vibe <repo> <branch>
-#       Same worktree/container setup as dispatch, but opens an interactive
-#       `opencode` (or a plain shell) for a human instead of running headless.
-#
+#       Same worktree/container setup, interactive session for a human.
 #   review-context <repo> <branch>
-#       Read-only. Prints a bundle (full diff, commit log, tracked issue,
-#       open PR) for the sdlc-review skill to hand to the reviewer subagent.
-#       Never touches git state — safe to run against a branch mid-flight.
-#
+#       Read-only bundle (diff, log, tracked issue, open PR) for the reviewer.
 #   quality <repo> [branch]
-#       Runs quality/grade.sh (lizard + jscpd) against <branch> (default:
-#       working tree) and prints a Scrutinizer-style grade. See docs/REVIEW.md
-#       for what the grade means and quality/thresholds.conf for the gate.
-#
+#       quality/grade.sh (lizard + jscpd) grade; thresholds.conf is the gate.
 #   ship [branch]
-#       Runs on the HOST (needs `gh` auth). Sweeps local agent branches ahead
-#       of default, runs each repo's test/build command AND the quality gate,
-#       and only if both are green pushes and opens a PR. Failing branches are
-#       left unpushed for a fix-up `dispatch` re-run.
-#
+#       Host-side (needs `gh`): per agent branch ahead of default, run the
+#       repo's test command AND the quality gate; push + open/update PR only
+#       if both green. Failing branches are left unpushed for a fix-up dispatch.
 #   sync [repo ...]
-#       After a PR merges: pulls the repo's default branch. In submodule
-#       projects, also stages and commits the updated pointer in the parent
-#       repo. Defaults to all configured repos.
-#
+#       Pull merged default branches; in submodule projects, stage+commit the
+#       moved pointer in the parent (never pushes it).
 #   status
-#       Read-only fleet view: per-repo branch, ahead/behind, local agent
-#       branches, open PRs, and live ag-sbx containers for this project's
-#       worktrees.
-#
+#       Read-only fleet view: branches, ahead counts, live containers, PRs.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
-#       Direct-editing counterpart to dispatch — human/host works the branch
-#       in the host tree instead of a container worker. Creates or resumes
-#       <branch> off the repo's default. Run `cli restore <repo>` when done.
-#       With no <branch>, lists the repo's checkoutable branches and exits.
-#
+#       Work a branch directly on the host; no branch = interactive picker.
 #   restore <repo> [--stash|--reset|--wip]
-#       Switch <repo> back to its default branch. Same dirty-tree handling
-#       as checkout.
-#
+#       Switch back to the default branch. Same dirty-tree handling as checkout.
 #   container <repo> [build|deploy|update|clean|status]
-#       Thin proxy to `ag-sbx` for the given repo's default (non-worktree)
-#       checkout — useful for warming/rebuilding the image. Per-branch
-#       dispatch containers are managed automatically by dispatch/ship.
-#
-#   config
-#       Print the resolved project configuration (paths, repos, image).
-#
-#   init [dir]
-#       Write a starter sdlc.conf into <dir> (default: current directory).
-#
-# Configuration: every subcommand resolves a project by walking up from $PWD
-# (or $SDLC_PROJECT) for an `sdlc.conf` file; $SDLC_CONFIG overrides the
-# search. Run `cli init` to create one, and see the comments in the generated
-# file for every supported knob.
+#       Thin proxy to `ag-sbx` for the repo's default checkout.
+#   config | init [dir]
+#       Print / write sdlc.conf; resolved by walking up from $PWD
+#       (or $SDLC_PROJECT; $SDLC_CONFIG overrides).
 #
 # Example: cli dispatch core agent/fix-nullifier "fix double-spend edge case"
 set -euo pipefail

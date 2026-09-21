@@ -9,8 +9,7 @@ code quality with self-hosted tooling instead of a SaaS dashboard.
 Repo-agnostic by design — point it at any project via `sdlc.conf` — and
 mapped explicitly against
 [Anthropic's AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook):
-see `docs/PLAYBOOK.md` for which stage each piece covers and what's
-deliberately left out for later.
+see `docs/PLAYBOOK.md` for the stage mapping and deliberate gaps.
 
 ## The three layers
 
@@ -35,10 +34,10 @@ deliberately left out for later.
    (shramee/agent-sandbox + docker/Dockerfile's opencode/lizard/jscpd layer)
 ```
 
-Why split it this way: a bash tool alone can dispatch and ship, but it can't
-hold judgment — "is this spec ready," "does this diff actually satisfy the
-criteria," "should this merge." That judgment now lives in skills (process)
-and a subagent (code), on top of mechanics that stayed boring on purpose.
+A bash tool alone can dispatch and ship, but it can't hold judgment —
+"is this spec ready," "does this diff satisfy the criteria," "should this
+merge." That judgment lives in skills (process) and a subagent (code), on
+top of mechanics that stayed boring on purpose.
 
 ## Install
 
@@ -51,8 +50,8 @@ ln -s ~/www/ai-sdlc/cli /usr/local/bin/ai-sdlc-cli   # or add it to $PATH as `cl
 git clone https://github.com/shramee/agent-sandbox ~/www/agent-sandbox
 ~/www/agent-sandbox/install.sh
 
-# 3. opencode, on the host too (cli copies ~/.local/share/opencode/auth.json
-#    into each dispatch container — see docker/README.md)
+# 3. opencode, on the host too (cli copies auth.json into each container —
+#    docker/README.md)
 npm install -g opencode-ai && opencode auth login
 
 # 4. this repo's sandbox layer (opencode + lizard + jscpd on top of
@@ -68,8 +67,8 @@ Then, in a consuming project:
 ```bash
 cd ~/code/myproject
 cli init                 # writes sdlc.conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE
-cli config                # check what resolved
-cli status                 # read-only fleet view
+cli config               # check what resolved
+cli status               # read-only fleet view
 ```
 
 ## Use
@@ -80,59 +79,38 @@ judgment the mechanics don't have. Start at
 `sdlc-intent` → `sdlc-dispatch` → `sdlc-ship` → `sdlc-review` → `sdlc-sync`,
 with `sdlc-status` and `sdlc-checkout` available any time.
 
-The underlying commands, if you want the mechanics directly:
-
-| | |
-|---|---|
-| `cli dispatch <repo> <branch> "<spec>"` | Run `opencode` on a host worktree inside its `ag-sbx` container |
-| `cli vibe <repo> <branch>` | Same worktree/container, interactive session for a human |
-| `cli checkout <repo> [branch]` / `cli restore <repo>` | Work the branch directly on the host instead |
-| `cli ship [branch]` | Test + quality gate, then push and open a PR |
-| `cli review-context <repo> <branch>` | Read-only diff/log/issue/PR bundle for the reviewer subagent |
-| `cli quality <repo> [branch]` | Run the quality gate standalone |
-| `cli sync [repo ...]` | Pull merged default branches; move submodule pointers |
-| `cli status` | Per-repo branches, ahead counts, live containers, open PRs |
-| `cli container <repo> [build\|deploy\|update\|clean\|status]` | Proxy to `ag-sbx` |
-| `cli config` / `cli init` | Print / write `sdlc.conf` |
+Subcommand reference: the `cli` header comment (`cli` with no args prints it).
 
 ## Why worktrees live on the host
 
-A container that mounts the whole project at one fixed path (e.g.
-`/workspace`) unrelated to the host layout forces worktrees to be created
-*inside* the container's own filesystem — a worktree's `.git` pointer is an
-absolute path baked in at creation, so it only resolves from the side that
-created it, and keeping host and container from fighting over the same
-worktree needs its own prune/lock machinery.
+A container mounting the project at one fixed path (e.g. `/workspace`)
+forces worktrees to be created *inside* the container — a worktree's `.git`
+pointer is an absolute path baked in at creation, so it only resolves from
+the side that created it, and host/container contention needs its own
+prune/lock machinery.
 
 `ag-sbx` sidesteps this: it mounts a directory at the **identical path**
-inside the container as on the host. So worktrees live on the host, created
-with plain
-`git worktree add`, and the container `cd`s into the same path — the `.git`
-pointer just works from both sides. No container-side worktree surgery, no
-locking against a host-side prune, no dead-pointer class of bug. See the
-comment at the top of `cli` and `docker/README.md` for the mechanics.
+inside as on the host. Worktrees live on the host (`git worktree add`), the
+container `cd`s into the same path, and the `.git` pointer just works.
+Mechanics: `docker/README.md`.
 
 ## Quality gate
 
 `quality/grade.sh` runs [lizard](https://github.com/terryyin/lizard)
-(per-function cyclomatic complexity, length, parameter count — multi-language)
-and [jscpd](https://github.com/kucherenko/jscpd) (cross-file duplication),
-rolls them into a 0–10 / A–F score against `quality/thresholds.conf`, with a
-hard ceiling on any single function's complexity that fails the gate
-regardless of the overall score. It's the self-hosted answer to what a tool
-like Scrutinizer CI graded — no SaaS account, runs the same in CI, in
-`cli ship`, and inside the reviewer subagent's own review. See
-`docs/REVIEW.md` for what the grade means and doesn't mean.
+(per-function complexity, length, parameter count) and
+[jscpd](https://github.com/kucherenko/jscpd) (cross-file duplication), rolled
+into a 0–10 / A–F score against `quality/thresholds.conf`, with a hard
+ceiling on any single function's complexity. No SaaS account; same in CI, in
+`cli ship`, and inside the reviewer's own review. What the grade means:
+`docs/REVIEW.md`.
 
 ## Review policy
 
 The reviewer subagent (`.claude/agents/reviewer.md`) is deliberately
-adversarial: it hunts for duplicated logic, unjustified abstractions,
-architecture drift, and specific defect classes that LLM-authored code and
-tests are prone to (vacuous tests, weaker-than-spec assertions, scope
-leakage). Its verdict is evidence for a human code owner, never a merge
-decision by itself — full policy, severity tiers, and the tag-based
-remediation flow in `docs/REVIEW.md`.
+adversarial: it hunts duplicated logic, unjustified abstractions,
+architecture drift, and defect classes LLM-authored code is prone to. Its
+verdict is evidence for a human code owner, never a merge decision —
+`docs/REVIEW.md`.
 
 ## Layout
 
