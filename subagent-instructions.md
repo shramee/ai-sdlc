@@ -1,54 +1,60 @@
-Appended to every dispatched `opencode run` prompt unless a project overrides
-`SUBAGENT_INSTRUCTIONS` in its `sdlc.conf`.
+Appended to every dispatched `opencode run` prompt unless overridden by
+`SUBAGENT_INSTRUCTIONS` in `sdlc.conf`.
 
 ---
 
-## Minimal code, strict reuse
+## 1. Minimal code, strict reuse
 
-Grep for prior art before writing anything new — the reviewer's first move
-is the same grep, and a duplicate helper, unneeded abstraction, or unasked
-config knob comes back as a finding, not a compliment. Prefer:
+- Grep for prior art before writing anything new: the reviewer's first move
+  is the same grep, and a duplicate comes back as a finding, not a
+  compliment.
+- Use existing implementations instead of rewriting them; extend or call an
+  existing function rather than adding parallel logic.
+- No speculative abstractions, no config knobs nobody asked for. If a new
+  abstraction is genuinely right, name it in the final report and what it
+  replaces.
+- Delete code the change makes obsolete. Keep the diff as small as the
+  acceptance criteria allow.
 
-- Deleting code over adding it, when a change makes something obsolete.
-- Extending or calling an existing function over writing a parallel one.
-- The smallest diff that satisfies the acceptance criteria. No speculative
-  flexibility.
+## 2. Commit discipline
 
-If a new abstraction is genuinely right, name it in your final report and
-what it replaces.
+- Stage with `git add .` (never selective adds) so nothing changed is left
+  uncommitted.
+- Commit after each logical step, as soon as the code compiles; state what
+  still fails in the commit message.
+- Context budgets are strict; uncommitted work is a lost run.
 
-## Commit discipline
+## 3. Test verification via mutation
 
-Stage everything with `git add .` first (not selective adds). Commit after
-each meaningfully complete step — as soon as code **compiles**, with a
-message saying what still fails. You have a finite turn budget and no
-warning before it runs out; an uncommitted run is a lost run.
+A passing test is not evidence — this project has shipped defects a passing
+suite missed entirely: a nil-slice loop that made a check unconditionally
+pass, a reference copied where a copy was intended, a test body with no
+assertion. Before claiming any acceptance criterion is met:
 
-## A passing test is not evidence
+1. Break the specific logic the test checks.
+2. Confirm the test now fails.
+3. Revert, and confirm the test passes again.
+4. Record the failure output in the final report.
 
-Before claiming any acceptance criterion is met, break the thing the test
-checks, confirm the test now fails, revert, and report what the failure
-looked like. This project has shipped defects a passing suite missed: a
-nil-slice loop that made a check unconditionally pass, a reference where a
-copy was intended so "many" cases were secretly one, a test body with no
-assertion. Assume that class of defect until you've ruled it out.
+## 4. Run logging (`agent.log`)
 
-## agent.log
+Append a single-line entry to `./agent.log` (a symlink to the host-side run
+log) immediately after every action, *before* moving on — if the run fails,
+this log is what a human diagnoses from:
 
-There is an `agent.log` file in your working directory (a symlink to the
-host-side run log). Append a line after every significant step — not just
-successes: files explored, commands run and results, decisions and why,
-approaches abandoned, errors and how resolved (or not). Log *before* moving
-on — if the run fails, this log is what a human diagnoses from. One line
-per step, e.g.:
+- `[explore]` Files read or searched.
+- `[try]` Commands run and their result.
+- `[decision]` Approach chosen or discarded, and why.
+- `[fix]` Changes made to resolve an error.
+- `[done]` Checkpoint reached; commit created.
 
-    [explore] found the existing rate-limiter in src/lib/limit.ts
-    [try] ran `pnpm build` — failed: missing export, see below
-    [fix] exported `Limiter` from index.ts (was package-private)
-    [done] pnpm build passed, committing
+## 5. Final report
 
-## Reporting
+End with:
 
-End with: files changed; how you verified each acceptance criterion,
-**including each mutation check and its observed failure**; code you reused
-(name it) versus added (justify it); anything you deliberately did not do.
+- **Files modified.**
+- **Verification evidence:** how each acceptance criterion was verified,
+  including each mutation check and its observed failure.
+- **New vs reused code:** existing utilities used (named) vs functions added
+  (justified).
+- **Out of scope:** anything deliberately left untouched.
