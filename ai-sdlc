@@ -395,15 +395,13 @@ container_name_for_dir() {
 # the worker's server with "Unexpected server error". So workers get a CLEAN
 # container-local state dir via XDG_DATA_HOME and only auth.json is copied in
 # (works against any container, never touches the referenced repo).
-worker_opencode_state() { echo "/home/agent/.local/share-opencode"; }
+worker_opencode_state() { echo "$PROJECT_ROOT/.sdlc/opencode"; }
 
-sync_opencode_credentials() {
-    local container="$1"
-    local state; state="$(worker_opencode_state)/opencode"
-    docker exec "$container" mkdir -p "$state"
+ensure_opencode_credentials() {
+    local ostate="$PROJECT_ROOT/.sdlc/opencode/opencode"
+    mkdir -p "$ostate"
     [ -f "$HOME/.local/share/opencode/auth.json" ] \
-        && docker cp "$HOME/.local/share/opencode/auth.json" "$container:$state/auth.json"
-    docker exec "$container" chown -R agent:agent "$(worker_opencode_state)" 2>/dev/null || true
+        && cp "$HOME/.local/share/opencode/auth.json" "$ostate/auth.json"
 }
 
 # Ensures the ag-sbx container for the project is up and echoes its name.
@@ -420,7 +418,7 @@ ensure_worker_container() {
     # the container name.
     ( cd "$PROJECT_ROOT" && "$AG_SBX_BIN" -- true >&2 )
     local container; container="$(container_name_for_dir "$PROJECT_ROOT")"
-    sync_opencode_credentials "$container"
+    ensure_opencode_credentials
 
     mkdir -p "$PROJECT_ROOT/.sdlc"
     local gcfg="$PROJECT_ROOT/.sdlc/agent-gitconfig"
