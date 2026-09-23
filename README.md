@@ -24,7 +24,7 @@ see `docs/PLAYBOOK.md` for the stage mapping and deliberate gaps.
 │  (aggressive, read-only, host-side subagent; gates every  │
 │  merge; verdict never self-approves — docs/REVIEW.md)     │
 ├─────────────────────────────────────────────────────────┤
-│  cli                              — the mechanics          │
+│  ai-sdlc                          — the mechanics          │
 │  (git worktrees, gh bookkeeping, ag-sbx/docker calls,      │
 │  the quality-gate runner — no judgment, just plumbing)    │
 └─────────────────────────────────────────────────────────┘
@@ -43,14 +43,14 @@ top of mechanics that stayed boring on purpose.
 
 ```bash
 # 1. This repo
-git clone https://github.com/shramee/ai-sdlc ~/www/ai-sdlc
-ln -s ~/www/ai-sdlc/cli /usr/local/bin/ai-sdlc-cli   # or add it to $PATH as `cli`
+git clone https://github.com/shramee/ai-sdlc ~/.ai-sdlc
+ln -s ~/.ai-sdlc/ai-sdlc /usr/local/bin/ai-sdlc
 
 # 2. agent-sandbox — owns image/container lifecycle, referenced not vendored
-git clone https://github.com/shramee/agent-sandbox ~/www/agent-sandbox
-~/www/agent-sandbox/install.sh
+git clone https://github.com/shramee/agent-sandbox ~/.agent-sandbox
+~/.agent-sandbox/install.sh
 
-# 3. opencode, on the host too (cli copies auth.json into each container —
+# 3. opencode, on the host too (ai-sdlc copies auth.json into each container —
 #    docker/README.md)
 npm install -g opencode-ai && opencode auth login
 
@@ -58,7 +58,7 @@ npm install -g opencode-ai && opencode auth login
 #    agent-sandbox) — see docker/README.md for build/push
 docker build -t youorg/ai-sdlc-sandbox:latest -f docker/Dockerfile docker/
 
-# 5. the quality tools, on the HOST too — `cli ship`/`cli quality` run there
+# 5. the quality tools, on the HOST too — `ai-sdlc ship`/`ai-sdlc quality` run there
 pip install lizard && npm install -g jscpd
 ```
 
@@ -66,9 +66,9 @@ Then, in a consuming project:
 
 ```bash
 cd ~/code/myproject
-cli init                 # writes sdlc.conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE
-cli config               # check what resolved
-cli status               # read-only fleet view
+ai-sdlc init                 # writes sdlc.conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE
+ai-sdlc config               # check what resolved
+ai-sdlc status               # read-only fleet view
 ```
 
 ## Use
@@ -79,7 +79,7 @@ judgment the mechanics don't have. Start at
 `sdlc-intent` → `sdlc-dispatch` → `sdlc-ship` → `sdlc-review` → `sdlc-sync`,
 with `sdlc-status` and `sdlc-checkout` available any time.
 
-Subcommand reference: the `cli` header comment (`cli` with no args prints it).
+Subcommand reference: the `ai-sdlc` header comment (`ai-sdlc` with no args prints it).
 
 ## Why worktrees live on the host
 
@@ -101,7 +101,7 @@ Mechanics: `docker/README.md`.
 [jscpd](https://github.com/kucherenko/jscpd) (cross-file duplication), rolled
 into a 0–10 / A–F score against `quality/thresholds.conf`, with a hard
 ceiling on any single function's complexity. No SaaS account; same in CI, in
-`cli ship`, and inside the reviewer's own review. What the grade means:
+`ai-sdlc ship`, and inside the reviewer's own review. What the grade means:
 `docs/REVIEW.md`.
 
 ## Review policy
@@ -115,9 +115,9 @@ verdict is evidence for a human code owner, never a merge decision —
 ## Layout
 
 ```
-cli                          mechanics: dispatch/ship/sync/status/checkout/quality
+ai-sdlc                      mechanics: dispatch/ship/sync/status/checkout/quality
 subagent-instructions.md     appended to every dispatch prompt
-examples/sdlc.conf.example   starter config, copied by `cli init`
+examples/sdlc.conf.example   starter config, copied by `ai-sdlc init`
 docker/                      Dockerfile extending agent-sandbox with opencode + quality tools
 quality/                     grade.sh + thresholds.conf — the self-hosted quality gate
 templates/                   intent.md / spec.md / plan.md — the Plan→Design→Build artifact chain

@@ -1,7 +1,7 @@
-# ai-sdlc project configuration — sourced as bash by the `cli` tool.
+# ai-sdlc project configuration — sourced as bash by the `ai-sdlc` tool.
 #
 # Its location defines the project root: every path below is relative to the
-# directory holding this file, and `cli` finds it by walking up from $PWD.
+# directory holding this file, and `ai-sdlc` finds it by walking up from $PWD.
 # Everything here is optional; the defaults shown are what you get if you
 # delete a line.
 

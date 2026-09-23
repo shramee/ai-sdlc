@@ -1,18 +1,18 @@
 ---
 name: sdlc-dispatch
-description: Turn a spec.md into a running opencode worker via `cli dispatch`. Use when a spec is ready to be worked, when resuming an interrupted dispatch, or when re-dispatching after a failed ship or a review finding.
+description: Turn a spec.md into a running opencode worker via `ai-sdlc dispatch`. Use when a spec is ready to be worked, when resuming an interrupted dispatch, or when re-dispatching after a failed ship or a review finding.
 ---
 
 # Dispatch
 
 ```bash
-cli dispatch <repo> agent/<slug> "$(cat spec.md)
+ai-sdlc dispatch <repo> agent/<slug> "$(cat spec.md)
 
 ## Branch context
 <see below if resuming>"
 ```
 
-`cli` appends `subagent-instructions.md` (worker behavior: reuse, commits,
+`ai-sdlc` appends `subagent-instructions.md` (worker behavior: reuse, commits,
 mutation checks, logging) to every prompt — don't re-paste it.
 
 ## First dispatch on a branch
@@ -22,7 +22,7 @@ The prompt is the spec, verbatim, from [`sdlc-intent`](../sdlc-intent/SKILL.md).
 ## Resuming a branch (multiple specs, or a remediation)
 
 Prepend a **Branch context** section — the worktree persists between
-dispatches, so each worker must know what it's building on. Check `cli
+dispatches, so each worker must know what it's building on. Check `ai-sdlc
 status` first for the ahead-count and live containers.
 
 ```markdown
@@ -38,7 +38,7 @@ Already landed here — do not disturb, do not redo:
 
 ```bash
 git -C <repo> log --oneline origin/<default>..agent/<slug>   # what committed
-docker exec <container-shown-by-cli-status> git status --short  # what's uncommitted
+docker exec <container-shown-by-ai-sdlc-status> git status --short  # what's uncommitted
 tail -5 .sdlc/logs/<repo>-agent-<slug>.log                       # where it stopped
 ```
 

@@ -9,12 +9,12 @@ FROM shramee/agent-sandbox:latest
 
 USER root
 
-# opencode: the execution backend for `cli dispatch`.
+# opencode: the execution backend for `ai-sdlc dispatch`.
 RUN npm install -g opencode-ai@latest
 
 # Quality gate tools (quality/grade.sh): lizard for complexity/length/params,
 # jscpd for cross-file duplication. Both need to exist in the sandbox AND on
-# whatever host runs `cli ship` / `cli quality` — see docs/REVIEW.md.
+# whatever host runs `ai-sdlc ship` / `ai-sdlc quality` — see docs/REVIEW.md.
 RUN pip install --break-system-packages --no-cache-dir lizard \
     && npm install -g jscpd@latest
 

@@ -6,7 +6,7 @@ the code. Full picture: `README.md`; playbook mapping: `docs/PLAYBOOK.md`.
 
 ## The three layers
 
-* **`cli`** — mechanics only: worktrees, `ag-sbx`/`docker`, `gh`, the quality
+* **`ai-sdlc`** — mechanics only: worktrees, `ag-sbx`/`docker`, `gh`, the quality
   gate. No judgment.
 * **`.claude/skills/sdlc-*`** — the runbook. Load the one matching your stage.
 * **`.claude/agents/reviewer.md`** — code judgment, gates every merge.
@@ -17,7 +17,7 @@ the code. Full picture: `README.md`; playbook mapping: `docs/PLAYBOOK.md`.
 Fresh work follows this order; jump to your stage when resuming:
 
 1. [`sdlc-intent`](.claude/skills/sdlc-intent/SKILL.md) — ask → `intent.md` → `spec.md` files.
-2. [`sdlc-dispatch`](.claude/skills/sdlc-dispatch/SKILL.md) — run a spec through `cli dispatch`.
+2. [`sdlc-dispatch`](.claude/skills/sdlc-dispatch/SKILL.md) — run a spec through `ai-sdlc dispatch`.
 3. [`sdlc-ship`](.claude/skills/sdlc-ship/SKILL.md) — tests + quality gate, push, open PR.
 4. [`sdlc-review`](.claude/skills/sdlc-review/SKILL.md) — reviewer subagent gates the merge; remediate via dispatch, re-review.
 5. [`sdlc-sync`](.claude/skills/sdlc-sync/SKILL.md) — after a human merges, pull default forward.
@@ -39,8 +39,8 @@ direct-edit exception).
 
 ## This repo itself
 
-* `bash -n cli` after every `cli` edit; `cli config` in a consuming project
-  is the end-to-end smoke test.
-* Nothing project-specific in `cli` — everything comes from `sdlc.conf` with
+* `bash -n ai-sdlc` after every `ai-sdlc` edit; `ai-sdlc config` in a consuming
+  project is the end-to-end smoke test.
+* Nothing project-specific in `ai-sdlc` — everything comes from `sdlc.conf` with
   a default; project-specific needs a new config knob.
 * `quality/grade.sh . "" quality/thresholds.conf` stays green here.

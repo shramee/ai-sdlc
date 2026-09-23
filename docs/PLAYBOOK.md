@@ -4,7 +4,7 @@ Anthropic's [AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc
 frames development as a loop of six stages, each committing a versioned
 artifact the next stage reads. This is the map from that loop onto this
 repo — read it before adding a skill or agent, so new work lands in the
-stage it belongs to. The three-layer structure (skills / reviewer / `cli`)
+stage it belongs to. The three-layer structure (skills / reviewer / `ai-sdlc`)
 is described once in `README.md`.
 
 | Stage | Playbook artifact | This repo | Human gate |
@@ -13,7 +13,7 @@ is described once in `README.md`.
 | **Design** | requirements + design in one pass | `templates/spec.md` (one per dispatchable unit) | Spec owner sign-off on open design decisions |
 | **Build** | `plan.md` before code, `CLAUDE.md`/`AGENTS.md` for institutional knowledge | `templates/plan.md`, written by the worker before editing; `subagent-instructions.md` as standing knowledge | Orchestrating session reviews the plan before dispatch proceeds (non-trivial work) |
 | **Test** | agents verify their own work | `subagent-instructions.md`'s mutation check; `test_cmd_for` in `sdlc.conf` | None — so the downstream gate isn't spent on catchable defects |
-| **Deploy** | agentic + human review; governance as code | `reviewer.md` + `quality/grade.sh` gate; policy in `docs/REVIEW.md`; `cli ship` as mechanical gate | Code owner approval — findings never self-approve |
+| **Deploy** | agentic + human review; governance as code | `reviewer.md` + `quality/grade.sh` gate; policy in `docs/REVIEW.md`; `ai-sdlc ship` as mechanical gate | Code owner approval — findings never self-approve |
 | **Maintain** | monitoring triggers new work into `intent.md` | Not yet built — see "Gaps" | Service/on-call owner triages, re-enters at Plan |
 
 ## Gaps this repo does not close yet

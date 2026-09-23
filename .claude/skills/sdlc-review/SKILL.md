@@ -1,11 +1,11 @@
 ---
 name: sdlc-review
-description: Gate a branch before merge with the reviewer subagent. Use once `cli ship` has pushed a branch and opened a PR, before approving or merging it, and again after every remediation dispatch.
+description: Gate a branch before merge with the reviewer subagent. Use once `ai-sdlc ship` has pushed a branch and opened a PR, before approving or merging it, and again after every remediation dispatch.
 ---
 
 # Review
 
-The **Deploy**-stage gate (`docs/PLAYBOOK.md`). A green `cli ship` means
+The **Deploy**-stage gate (`docs/PLAYBOOK.md`). A green `ai-sdlc ship` means
 tests and the quality gate passed — not that the code is right. The
 `reviewer` subagent judges; per `docs/REVIEW.md` its verdict never merges
 anything — it informs the human code owner who does.
@@ -13,8 +13,8 @@ anything — it informs the human code owner who does.
 ## 1. Gather context
 
 ```bash
-cli review-context <repo> <branch>   # diff, log, tracking issue, PR comments — read-only
-cli quality <repo> <branch>          # quality/grade.sh's score + findings
+ai-sdlc review-context <repo> <branch>   # diff, log, tracking issue, PR comments — read-only
+ai-sdlc quality <repo> <branch>          # quality/grade.sh's score + findings
 ```
 
 ## 2. Invoke the reviewer subagent

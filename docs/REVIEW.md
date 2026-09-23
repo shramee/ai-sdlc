@@ -1,7 +1,7 @@
 # Review policy
 
-Governs what `.claude/agents/reviewer.md` produces and how `cli ship` /
-`cli quality` gate on it. Modeled on the "review in both directions" and
+Governs what `.claude/agents/reviewer.md` produces and how `ai-sdlc ship` /
+`ai-sdlc quality` gate on it. Modeled on the "review in both directions" and
 governance-as-code sections of Anthropic's
 [AI-native SDLC playbook](https://claude.com/blog/the-ai-native-sdlc-playbook).
 
@@ -10,7 +10,7 @@ governance-as-code sections of Anthropic's
 **A reviewer finding, and a failing quality gate, never approve or block a
 PR by themselves.** Branch protection still requires a human code owner's
 approval — automation makes that approval *informed*, not replaced.
-`cli ship` withholding a push over a failed quality gate is the one
+`ai-sdlc ship` withholding a push over a failed quality gate is the one
 exception: a build-time gate on the unreviewed branch, not a review.
 
 ## Severity tiers
@@ -28,7 +28,7 @@ The reviewer's full defect-class list and its quality-gate read live in
 
 ## Tag-based fixes
 
-Close a finding by re-running `cli dispatch` on the same branch with the
+Close a finding by re-running `ai-sdlc dispatch` on the same branch with the
 finding as the prompt — not a human hand-edit. Then **re-review**: skipping
 it is how findings resurface.
 

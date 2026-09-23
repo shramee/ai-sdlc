@@ -33,7 +33,7 @@ order in each spec's "Decisions already made" section.
 
 ## 4. File them
 
-One GitHub issue per spec, body = the spec verbatim — or let `cli dispatch`
+One GitHub issue per spec, body = the spec verbatim — or let `ai-sdlc dispatch`
 create it automatically on first dispatch (label `status:dispatched`).
 Either is fine; do the split in step 3 regardless.
 

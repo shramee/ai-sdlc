@@ -1,12 +1,12 @@
 ---
 name: sdlc-sync
-description: Pull a merged PR's changes back with `cli sync`. Use right after a PR merges, to fast-forward the repo's default branch and (in submodule projects) commit the updated pointer in the parent repo.
+description: Pull a merged PR's changes back with `ai-sdlc sync`. Use right after a PR merges, to fast-forward the repo's default branch and (in submodule projects) commit the updated pointer in the parent repo.
 ---
 
 # Sync
 
 ```bash
-cli sync [repo ...]        # defaults to every repo in REPOS
+ai-sdlc sync [repo ...]        # defaults to every repo in REPOS
 ```
 
 Fast-forwards each repo's default branch. In submodule projects

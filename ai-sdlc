@@ -9,7 +9,7 @@
 # host-created git worktrees resolve from both sides. Create worktrees on the
 # host, cd into them, hand off to ag-sbx. See docker/README.md.
 #
-# Usage: cli <subcommand> [args...]
+# Usage: ai-sdlc <subcommand> [args...]
 #
 #   dispatch <repo> <branch> "<prompt>" [extra opencode flags...]
 #       Host worktree for <branch> + ag-sbx container + `opencode run --auto`
@@ -40,7 +40,7 @@
 #       Print / write sdlc.conf; resolved by walking up from $PWD
 #       (or $SDLC_PROJECT; $SDLC_CONFIG overrides).
 #
-# Example: cli dispatch core agent/fix-nullifier "fix double-spend edge case"
+# Example: ai-sdlc dispatch core agent/fix-nullifier "fix double-spend edge case"
 set -euo pipefail
 
 export GIT_PAGER=cat PAGER=cat GH_PAGER=cat GIT_EDITOR=true EDITOR=true VISUAL=true
@@ -57,7 +57,7 @@ _resolve_self() {
 SDLC_HOME="$(_resolve_self)"
 
 usage() {
-    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SDLC_HOME/cli"
+    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$SDLC_HOME/ai-sdlc"
     exit "${1:-1}"
 }
 
@@ -81,7 +81,7 @@ find_config() {
 
 load_config() {
     local conf
-    conf="$(find_config)" || die "no sdlc.conf found in $PWD or any parent — run 'cli init' to create one"
+    conf="$(find_config)" || die "no sdlc.conf found in $PWD or any parent — run 'ai-sdlc init' to create one"
     CONFIG_FILE="$conf"
     PROJECT_ROOT="$(cd "$(dirname "$conf")" && pwd)"
 
@@ -209,7 +209,7 @@ pick_branch() {
 
     if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
         echo "" >&2
-        echo "Pick one with 'cli checkout $repo <branch>', or name a new one to create it off $default_branch." >&2
+        echo "Pick one with 'ai-sdlc checkout $repo <branch>', or name a new one to create it off $default_branch." >&2
         return 0
     fi
 
@@ -443,7 +443,7 @@ prepare_worktree() {
 }
 
 cmd_dispatch() {
-    local USAGE_LINE='usage: cli dispatch <repo> <branch> "<prompt>" [extra opencode flags...]'
+    local USAGE_LINE='usage: ai-sdlc dispatch <repo> <branch> "<prompt>" [extra opencode flags...]'
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:?$USAGE_LINE}"
     local PROMPT="${3:?$USAGE_LINE}"
@@ -490,7 +490,7 @@ $instructions"
 }
 
 cmd_vibe() {
-    local USAGE_LINE="usage: cli vibe <repo> <branch>"
+    local USAGE_LINE="usage: ai-sdlc vibe <repo> <branch>"
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:?$USAGE_LINE}"
 
@@ -508,7 +508,7 @@ cmd_vibe() {
 
 # --------------------------------------------------------- review-context --
 cmd_review_context() {
-    local USAGE_LINE="usage: cli review-context <repo> <branch>"
+    local USAGE_LINE="usage: ai-sdlc review-context <repo> <branch>"
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:?$USAGE_LINE}"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -543,7 +543,7 @@ cmd_review_context() {
 
 # ------------------------------------------------------------- quality ----
 cmd_quality() {
-    local USAGE_LINE="usage: cli quality <repo> [branch]"
+    local USAGE_LINE="usage: ai-sdlc quality <repo> [branch]"
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:-}"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -695,7 +695,7 @@ cmd_sync() {
 
 # ------------------------------------------------------------- checkout ----
 cmd_checkout() {
-    local USAGE_LINE="usage: cli checkout <repo> [branch] [--stash|--reset|--wip]"
+    local USAGE_LINE="usage: ai-sdlc checkout <repo> [branch] [--stash|--reset|--wip]"
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:-}"
     case "$BRANCH" in --*) BRANCH="" ;; esac
@@ -718,14 +718,14 @@ cmd_checkout() {
     echo "on the host — no container worker dispatched."
     echo "Follow $SUBAGENT_INSTRUCTIONS: stage everything (git add .) and"
     echo "commit early and often as steps complete."
-    echo "Run 'cli restore $REPO' when done; a later 'cli dispatch' on this"
+    echo "Run 'ai-sdlc restore $REPO' when done; a later 'ai-sdlc dispatch' on this"
     echo "branch picks up whatever was committed here."
 
     open_terminal "checkout:$REPO/$BRANCH" "cd \"$dir\" && exec \"\${SHELL:-bash}\" -l"
 }
 
 cmd_restore() {
-    local USAGE_LINE="usage: cli restore <repo> [--stash|--reset|--wip]"
+    local USAGE_LINE="usage: ai-sdlc restore <repo> [--stash|--reset|--wip]"
     local REPO="${1:?$USAGE_LINE}"
     local mode; mode="$(dirty_mode_flag "${@:2}")"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -740,7 +740,7 @@ cmd_restore() {
 
 # ---------------------------------------------------------------- container
 cmd_container() {
-    local USAGE_LINE="usage: cli container <repo> [build|deploy|update|clean|status]"
+    local USAGE_LINE="usage: ai-sdlc container <repo> [build|deploy|update|clean|status]"
     local REPO="${1:?$USAGE_LINE}"
     local ACTION="${2:-status}"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -822,7 +822,7 @@ cmd_init() {
     local conf="$target/sdlc.conf"
     [ -e "$conf" ] && die "$conf already exists"
     cp "$SDLC_HOME/examples/sdlc.conf.example" "$conf"
-    echo "Wrote $conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE, then run 'cli config'."
+    echo "Wrote $conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE, then run 'ai-sdlc config'."
 }
 
 # ----------------------------------------------------------------- main ----

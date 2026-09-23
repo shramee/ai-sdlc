@@ -17,7 +17,7 @@ REPO_DIR="${1:?usage: grade.sh <repo-dir> [branch] [thresholds-file]}"
 BRANCH="${2:-}"
 THRESHOLDS_FILE="${3:-$(dirname "${BASH_SOURCE[0]}")/thresholds.conf}"
 
-command -v lizard >/dev/null 2>&1 || { echo "!! lizard not found — pip install lizard (it's in docker/Dockerfile for the sandbox; install it on the host too for 'cli ship' to gate on it)" >&2; exit 2; }
+command -v lizard >/dev/null 2>&1 || { echo "!! lizard not found — pip install lizard (it's in docker/Dockerfile for the sandbox; install it on the host too for 'ai-sdlc ship' to gate on it)" >&2; exit 2; }
 command -v jscpd >/dev/null 2>&1 || { echo "!! jscpd not found — npm install -g jscpd (same story: sandbox has it, host needs it too)" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "!! python3 not found — needed to parse lizard/jscpd output" >&2; exit 2; }
 

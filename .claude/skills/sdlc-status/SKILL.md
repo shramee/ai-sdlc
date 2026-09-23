@@ -1,12 +1,12 @@
 ---
 name: sdlc-status
-description: Read-only fleet view via `cli status`. Use to check what's in flight before picking up more work, to answer "what's dispatched right now", or before re-dispatching to see whether a branch's container is still live.
+description: Read-only fleet view via `ai-sdlc status`. Use to check what's in flight before picking up more work, to answer "what's dispatched right now", or before re-dispatching to see whether a branch's container is still live.
 ---
 
 # Status
 
 ```bash
-cli status
+ai-sdlc status
 ```
 
 Per repo: current branch, dirty files, every `agent/*` branch with its

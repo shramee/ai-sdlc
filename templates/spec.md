@@ -1,6 +1,6 @@
 # Spec: <short name>
 
-The GitHub-issue body, the `cli dispatch` prompt, and what the reviewer
+The GitHub-issue body, the `ai-sdlc dispatch` prompt, and what the reviewer
 subagent checks the diff against. Derived from `templates/intent.md`; link
 it. Precision beats length.
 

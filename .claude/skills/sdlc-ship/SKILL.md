@@ -1,12 +1,12 @@
 ---
 name: sdlc-ship
-description: Validate and ship a dispatched branch with `cli ship` — tests, the quality gate, then push and open a PR. Use when a spec's work looks complete and needs to become a reviewable PR.
+description: Validate and ship a dispatched branch with `ai-sdlc ship` — tests, the quality gate, then push and open a PR. Use when a spec's work looks complete and needs to become a reviewable PR.
 ---
 
 # Ship
 
 ```bash
-cli ship agent/<slug>
+ai-sdlc ship agent/<slug>
 ```
 
 Runs on the host, needs `gh` auth. Runs the repo's `test_cmd_for` command
@@ -28,5 +28,5 @@ A quality-gate failure is not a false alarm to route around: read
 ## Once it's pushed
 
 Do not merge yet — hand off to [`sdlc-review`](../sdlc-review/SKILL.md).
-Green `cli ship` is a necessary gate, not the review; tests-passing doesn't
+Green `ai-sdlc ship` is a necessary gate, not the review; tests-passing doesn't
 self-approve a merge (`docs/REVIEW.md`).

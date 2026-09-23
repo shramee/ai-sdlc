@@ -27,7 +27,7 @@ ALLOWED: `git show`, `git diff`, `git log`, `git cat-file`, `gh` reads,
 `quality/grade.sh` (reads only), and Read/Grep/Glob.
 
 - Read branch content without checkout: `git -C <repo> show <branch>:<path>`.
-- Handed `cli review-context` output (diff, log, issue, PR comments)? Start there.
+- Handed `ai-sdlc review-context` output (diff, log, issue, PR comments)? Start there.
 
 ## 2. Minimal code, strict reuse, robust architecture
 
