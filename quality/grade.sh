@@ -44,7 +44,7 @@ cd "$REPO_DIR"
 # we have a branch, since we only want to grade what this diff touched.
 SCOPE_FILES=()
 if [ -n "$BRANCH" ]; then
-    default_branch="$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')"
+    default_branch="$(git remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p' || true)"
     while IFS= read -r f; do
         [ -f "$f" ] && SCOPE_FILES+=("$f")
     done < <(git diff --name-only "origin/$default_branch...$BRANCH" 2>/dev/null || true)
