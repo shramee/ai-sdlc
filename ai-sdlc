@@ -368,7 +368,9 @@ ag_sbx_env() {
 container_name_for_dir() {
     # Mirror ag-sbx's own naming (sbx-<5 of dirname>-<4 hex of path>) so we can
     # `docker exec`/`docker cp` against it directly without re-invoking ag-sbx
-    # for every single step of a dispatch.
+    # for every single step of a dispatch. Worker containers are keyed off the
+    # PROJECT ROOT (not the worktree) so a worktree's .git pointer — an
+    # absolute path into <project>/.git — resolves inside the container.
     local dir="$1" dname hash
     dname="$(basename "$dir" | tr -cd 'A-Za-z0-9_.-' | cut -c1-5 | tr 'A-Z' 'a-z')"
     hash="$(printf '%s' "$dir" | shasum -a 256 | cut -c1-4)"
@@ -391,18 +393,30 @@ sync_opencode_credentials() {
     docker exec "$container" chown -R agent:agent /home/agent/.local/share/opencode /home/agent/.config/opencode 2>/dev/null || true
 }
 
-# Ensures the ag-sbx container for $1 (a directory) is up, with opencode
-# credentials synced and the agent git identity set. Echoes its container name.
+# Ensures the ag-sbx container for the project is up and echoes its name.
+# Created from PROJECT_ROOT — not the worktree — because a worktree's .git is
+# a pointer file into <project>/.git/worktrees/<slug>, which only resolves
+# when the project root (including .git) is the mounted directory. Worker
+# identity travels per-exec via GIT_CONFIG_GLOBAL: ag-sbx bind-mounts
+# ~/.gitconfig read-only, so `git config --global` cannot write it.
 ensure_worker_container() {
-    local dir="$1"
     require_ag_sbx
     ag_sbx_env
-    ( cd "$dir" && "$AG_SBX_BIN" -- true )
-    local container; container="$(container_name_for_dir "$dir")"
+    ( cd "$PROJECT_ROOT" && "$AG_SBX_BIN" -- true )
+    local container; container="$(container_name_for_dir "$PROJECT_ROOT")"
     sync_opencode_credentials "$container"
-    [ -n "$AGENT_GIT_NAME" ] && docker exec "$container" git config --global user.name "$AGENT_GIT_NAME"
-    [ -n "$AGENT_GIT_EMAIL" ] && docker exec "$container" git config --global user.email "$AGENT_GIT_EMAIL"
-    docker exec "$container" git config --global --add safe.directory '*' || true
+
+    mkdir -p "$PROJECT_ROOT/.sdlc"
+    local gcfg="$PROJECT_ROOT/.sdlc/agent-gitconfig"
+    {
+        echo "[user]"
+        echo "	name = ${AGENT_GIT_NAME:-agent}"
+        echo "	email = ${AGENT_GIT_EMAIL:-agent@localhost}"
+        echo "[safe]"
+        echo "	directory = *"
+    } > "$gcfg"
+    chmod 600 "$gcfg"
+
     echo "$container"
 }
 
@@ -477,12 +491,13 @@ cmd_dispatch() {
 
 $instructions"
 
-    local container; container="$(ensure_worker_container "$WORKTREE")"
+    local container; container="$(ensure_worker_container)"
+    local idenv=(-e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig")
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
 
-    docker exec -w "$WORKTREE" "$container" \
+    docker exec -w "$WORKTREE" "${idenv[@]}" "$container" \
         "${OPENCODE_CMD[@]}" "${model_flags[@]}" "$@" --dir "$WORKTREE" -- "$FULL_PROMPT" \
         2>&1 | tee -a "$LOG_FILE"
 
@@ -496,12 +511,13 @@ cmd_vibe() {
 
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
-    local container; container="$(ensure_worker_container "$WORKTREE")"
+    local container; container="$(ensure_worker_container)"
+    local idenv=(-e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig")
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
 
-    local cmd="docker exec -it -w \"$WORKTREE\" $container opencode ${model_flags[*]}"
+    local cmd="docker exec -it -w \"$WORKTREE\" ${idenv[*]} $container opencode ${model_flags[*]}"
     echo "Opening interactive opencode session for $REPO:$BRANCH..."
     open_terminal "vibe:$REPO/$BRANCH" "$cmd"
 }
@@ -764,25 +780,24 @@ cmd_status() {
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "== $repo: not initialized =="; continue; }
 
-        local default_branch cur dirty
+        local default_branch cur dirty live=""
         default_branch="$(default_branch_of "$dir")"
         cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
         dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
 
-        echo "== $repo (on $cur, default $default_branch, $dirty dirty file(s)) =="
+        # Worker containers are project-rooted (one serves every branch), so
+        # the live check is per repo, not per branch.
+        local pcont; pcont="$(container_name_for_dir "$PROJECT_ROOT")"
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$pcont" \
+            && live=" [worker container: $pcont running]"
+
+        echo "== $repo (on $cur, default $default_branch, $dirty dirty file(s))$live =="
 
         git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX" | while read -r br; do
             [ -z "$br" ] && continue
             local ahead
             ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
-            local label; label="$(repo_label_of "$repo")"
-            local wt="$WORKTREES_DIR/$label/${br//\//-}"
-            local live=""
-            if [ -d "$wt" ]; then
-                local cname; cname="$(container_name_for_dir "$wt")"
-                docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cname" && live=" [container: $cname running]"
-            fi
-            echo "  branch $br: $ahead commit(s) ahead of $default_branch$live"
+            echo "  branch $br: $ahead commit(s) ahead of $default_branch"
         done
 
         local slug

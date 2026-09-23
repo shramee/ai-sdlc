@@ -15,7 +15,9 @@ path* inside as out — which is exactly what `ai-sdlc`'s host-side worktree mod
 (`prepare_worktree`/`ensure_worker_container`) leans on: a worktree's
 `.git` pointer is an absolute path, and because ag-sbx doesn't translate
 paths the way a monolithic `/workspace` mount would, that pointer resolves
-the same from both sides with no container-side worktree surgery.
+the same from both sides with no container-side worktree surgery. Worker
+containers are created from the project root for exactly this reason — the
+worktree's `.git` pointer resolves inside them too.
 
 ## Why this repo has its own Dockerfile
 
