@@ -412,7 +412,10 @@ sync_opencode_credentials() {
 ensure_worker_container() {
     require_ag_sbx
     ag_sbx_env
-    ( cd "$PROJECT_ROOT" && "$AG_SBX_BIN" -- true )
+    # ag-sbx prints its banner ("Creating/Reusing running container …") on
+    # stdout; this function is captured, so route it to stderr and echo only
+    # the container name.
+    ( cd "$PROJECT_ROOT" && "$AG_SBX_BIN" -- true >&2 )
     local container; container="$(container_name_for_dir "$PROJECT_ROOT")"
     sync_opencode_credentials "$container"
 
