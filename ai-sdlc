@@ -388,19 +388,22 @@ container_name_for_dir() {
 }
 
 # opencode's auth lives in ~/.local/share/opencode/auth.json (small) next to a
-# multi-GB local db (opencode.db) we must NOT mount or copy wholesale. `ag-sbx`
-# doesn't know about opencode, so rather than fork it, sync just the
-# credential + config files in with `docker cp` after ag-sbx has the
-# container up — works regardless of ag-sbx's own mount set, and never touches
-# the referenced repo.
+# multi-GB local database (opencode.db) we must NOT mount or copy wholesale.
+# ag-sbx nevertheless bind-mounts the host's whole ~/.local/share/opencode
+# into the worker — and a live SQLite file served through the mount reads back
+# as "file is not a database" while the host opencode is running, which kills
+# the worker's server with "Unexpected server error". So workers get a CLEAN
+# container-local state dir via XDG_DATA_HOME and only auth.json is copied in
+# (works against any container, never touches the referenced repo).
+worker_opencode_state() { echo "/home/agent/.local/share-opencode"; }
+
 sync_opencode_credentials() {
     local container="$1"
-    local auth="$HOME/.local/share/opencode/auth.json"
-    local cfg="$HOME/.config/opencode/opencode.json"
-    docker exec "$container" mkdir -p /home/agent/.local/share/opencode /home/agent/.config/opencode
-    [ -f "$auth" ] && docker cp "$auth" "$container:/home/agent/.local/share/opencode/auth.json"
-    [ -f "$cfg" ] && docker cp "$cfg" "$container:/home/agent/.config/opencode/opencode.json"
-    docker exec "$container" chown -R agent:agent /home/agent/.local/share/opencode /home/agent/.config/opencode 2>/dev/null || true
+    local state; state="$(worker_opencode_state)/opencode"
+    docker exec "$container" mkdir -p "$state"
+    [ -f "$HOME/.local/share/opencode/auth.json" ] \
+        && docker cp "$HOME/.local/share/opencode/auth.json" "$container:$state/auth.json"
+    docker exec "$container" chown -R agent:agent "$(worker_opencode_state)" 2>/dev/null || true
 }
 
 # Ensures the ag-sbx container for the project is up and echoes its name.
@@ -507,7 +510,10 @@ cmd_dispatch() {
 $instructions"
 
     local container; container="$(ensure_worker_container)"
-    local idenv=(-e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig")
+    local idenv=(
+        -e "XDG_DATA_HOME=$(worker_opencode_state)"
+        -e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig"
+    )
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
@@ -527,7 +533,10 @@ cmd_vibe() {
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
     local container; container="$(ensure_worker_container)"
-    local idenv=(-e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig")
+    local idenv=(
+        -e "XDG_DATA_HOME=$(worker_opencode_state)"
+        -e "GIT_CONFIG_GLOBAL=$PROJECT_ROOT/.sdlc/agent-gitconfig"
+    )
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
