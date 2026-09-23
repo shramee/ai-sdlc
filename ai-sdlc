@@ -136,7 +136,14 @@ require_repo() {
 }
 
 default_branch_of() {
-    git -C "$1" remote show origin | sed -n '/HEAD branch/s/.*: //p'
+    # `git remote show origin` needs the remote's HEAD set; fresh local/bare
+    # origins never set it and report "(unknown)". Fall back to origin/HEAD.
+    local br
+    br="$(git -C "$1" remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')"
+    if [ -z "$br" ] || [ "$br" = "(unknown)" ]; then
+        br="$(git -C "$1" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+    fi
+    echo "$br"
 }
 
 repo_slug_of() {
@@ -439,6 +446,8 @@ prepare_worktree() {
     echo "Fetching $REPO" | tee -a "$LOG_FILE"
     git -C "$dir" fetch origin 2>&1 | tee -a "$LOG_FILE"
     local default_branch; default_branch="$(default_branch_of "$dir")"
+    [ -n "$default_branch" ] \
+        || die "cannot determine the default branch of origin for $REPO — set it with: git -C <repo> remote set-head origin -a"
 
     if [ -d "$WORKTREE" ] && git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
         echo "Resuming worktree $WORKTREE" | tee -a "$LOG_FILE"
