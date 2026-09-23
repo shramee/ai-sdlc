@@ -280,7 +280,10 @@ ensure_clean_or_stash() {
             ;;
         reset)
             git -C "$dir" reset --hard >/dev/null
-            git -C "$dir" clean -fd >/dev/null
+            # Keep the tool's own config: sdlc.conf is written by init and is
+            # untracked unless the project chooses to commit it — clean -fd
+            # would otherwise silently delete it on the first --reset.
+            git -C "$dir" clean -fd -e sdlc.conf >/dev/null
             echo "Discarded uncommitted changes in $dir." >&2
             ;;
         wip)
