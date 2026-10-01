@@ -1,8 +1,8 @@
 # ai-sdlc
 
-An agentic SDLC where a main agent orchestrates and a sandboxed worker
-executes: **Claude Code, driven by skills, dispatches [`opencode`](https://opencode.ai)
-workers into [`ag-sbx`](https://github.com/shramee/agent-sandbox) containers**,
+An agentic SDLC where a main agent orchestrates and a worker executes:
+**Claude Code, driven by skills, dispatches [`opencode`](https://opencode.ai)
+workers into per-branch git worktrees on the same machine — no Docker**,
 gates every merge with an aggressive read-only reviewer subagent, and grades
 code quality with self-hosted tooling instead of a SaaS dashboard.
 
@@ -25,13 +25,13 @@ see `docs/PLAYBOOK.md` for the stage mapping and deliberate gaps.
 │  merge; verdict never self-approves — docs/REVIEW.md)     │
 ├─────────────────────────────────────────────────────────┤
 │  ai-sdlc                          — the mechanics          │
-│  (git worktrees, gh bookkeeping, ag-sbx/docker calls,      │
+│  (git worktrees, gh bookkeeping, opencode runs,            │
 │  the quality-gate runner — no judgment, just plumbing)    │
 └─────────────────────────────────────────────────────────┘
          │
          ▼
-   ag-sbx container ── opencode run --auto ── host git worktree
-   (shramee/agent-sandbox + docker/Dockerfile's opencode/lizard/jscpd layer)
+   opencode run --auto ── host git worktree
+   (guard/ shims refuse the worker's `git push` and `gh`)
 ```
 
 A bash tool alone can dispatch and ship, but it can't hold judgment —
@@ -46,19 +46,10 @@ top of mechanics that stayed boring on purpose.
 git clone https://github.com/shramee/ai-sdlc ~/.ai-sdlc
 ln -s ~/.ai-sdlc/ai-sdlc /usr/local/bin/ai-sdlc
 
-# 2. agent-sandbox — owns image/container lifecycle, referenced not vendored
-git clone https://github.com/shramee/agent-sandbox ~/.agent-sandbox
-~/.agent-sandbox/install.sh
-
-# 3. opencode, on the host too (ai-sdlc copies auth.json into each container —
-#    docker/README.md)
+# 2. opencode — the worker
 npm install -g opencode-ai && opencode auth login
 
-# 4. this repo's sandbox layer (opencode + lizard + jscpd on top of
-#    agent-sandbox) — see docker/README.md for build/push
-docker build -t youorg/ai-sdlc-sandbox:latest -f docker/Dockerfile docker/
-
-# 5. the quality tools, on the HOST too — `ai-sdlc ship`/`ai-sdlc quality` run there
+# 3. the quality tools — `ai-sdlc ship`/`ai-sdlc quality` run them
 pip install lizard && npm install -g jscpd
 ```
 
@@ -66,7 +57,7 @@ Then, in a consuming project:
 
 ```bash
 cd ~/code/myproject
-ai-sdlc init                 # writes sdlc.conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE
+ai-sdlc init                 # writes sdlc.conf — edit REPOS / test_cmd_for / OPENCODE_MODEL
 ai-sdlc config               # check what resolved
 ai-sdlc status               # read-only fleet view
 ```
@@ -81,18 +72,18 @@ with `sdlc-status` and `sdlc-checkout` available any time.
 
 Subcommand reference: the `ai-sdlc` header comment (`ai-sdlc` with no args prints it).
 
-## Why worktrees live on the host
+## Isolation without a container
 
-A container mounting the project at one fixed path (e.g. `/workspace`)
-forces worktrees to be created *inside* the container — a worktree's `.git`
-pointer is an absolute path baked in at creation, so it only resolves from
-the side that created it, and host/container contention needs its own
-prune/lock machinery.
+Workers run `opencode run --auto` on the host, from inside a per-branch git
+worktree (`git worktree add` — never the default branch). The worker's commit
+identity comes from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` as per-process env vars,
+so the host's git config is untouched. `guard/` is first on the worker's PATH
+and refuses `git push` and `gh`, so workers commit locally and the host ships.
 
-`ag-sbx` sidesteps this: it mounts a directory at the **identical path**
-inside as on the host. Worktrees live on the host (`git worktree add`), the
-container `cd`s into the same path, and the `.git` pointer just works.
-Mechanics: `docker/README.md`.
+That is a guard against accidents, not a sandbox: the worker runs as you, can
+read and write anything you can, and `/usr/bin/git push` still works. If you
+need real isolation (untrusted prompts or models), run `ai-sdlc` itself inside
+a VM or container of your own.
 
 ## Quality gate
 
@@ -118,7 +109,7 @@ verdict is evidence for a human code owner, never a merge decision —
 ai-sdlc                      mechanics: dispatch/ship/sync/status/checkout/quality
 subagent-instructions.md     appended to every dispatch prompt
 examples/sdlc.conf.example   starter config, copied by `ai-sdlc init`
-docker/                      Dockerfile extending agent-sandbox with opencode + quality tools
+guard/                       PATH shims that refuse `git push` and `gh` for dispatched workers
 quality/                     grade.sh + thresholds.conf — the self-hosted quality gate
 templates/                   intent.md / spec.md / plan.md — the Plan→Design→Build artifact chain
 docs/                        REVIEW.md (policy) and PLAYBOOK.md (stage mapping, gaps)

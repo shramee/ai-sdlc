@@ -23,7 +23,7 @@ The prompt is the spec, verbatim, from [`sdlc-intent`](../sdlc-intent/SKILL.md).
 
 Prepend a **Branch context** section — the worktree persists between
 dispatches, so each worker must know what it's building on. Check `ai-sdlc
-status` first for the ahead-count and live containers.
+status` first for the ahead-count and running workers.
 
 ```markdown
 ## Branch context
@@ -38,7 +38,7 @@ Already landed here — do not disturb, do not redo:
 
 ```bash
 git -C <repo> log --oneline origin/<default>..agent/<slug>   # what committed
-docker exec <container-shown-by-ai-sdlc-status> git status --short  # what's uncommitted
+git -C .sdlc/worktrees/<repo>/agent-<slug> status --short          # what's uncommitted
 tail -5 .sdlc/logs/<repo>-agent-<slug>.log                       # where it stopped
 ```
 

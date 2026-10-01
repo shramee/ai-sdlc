@@ -1,6 +1,6 @@
 ---
 name: sdlc-checkout
-description: Work a branch directly on the host instead of dispatching a sandboxed worker, via `ai-sdlc checkout` / `ai-sdlc restore`. Use when a human — or the orchestrating session itself, deliberately entering direct-edit mode — needs to write code by hand rather than through opencode.
+description: Work a branch directly on the host instead of dispatching a worker, via `ai-sdlc checkout` / `ai-sdlc restore`. Use when a human — or the orchestrating session itself, deliberately entering direct-edit mode — needs to write code by hand rather than through opencode.
 ---
 
 # Checkout (direct-edit mode)

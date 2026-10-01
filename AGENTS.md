@@ -1,12 +1,11 @@
 # ai-sdlc
 
 An agentic SDLC: a main agent (Claude Code) orchestrates, `opencode` workers
-in [agent-sandbox](https://github.com/shramee/agent-sandbox) containers write
-the code. Full picture: `README.md`; playbook mapping: `docs/PLAYBOOK.md`.
+in per-branch git worktrees on the same machine write the code. Full picture: `README.md`; playbook mapping: `docs/PLAYBOOK.md`.
 
 ## The three layers
 
-* **`ai-sdlc`** — mechanics only: worktrees, `ag-sbx`/`docker`, `gh`, the quality
+* **`ai-sdlc`** — mechanics only: worktrees, `opencode`, `gh`, the quality
   gate. No judgment.
 * **`.claude/skills/sdlc-*`** — the runbook. Load the one matching your stage.
 * **`.claude/agents/reviewer.md`** — code judgment, gates every merge.
@@ -29,7 +28,7 @@ direct-edit exception).
 ## Division of labor
 
 * Workers write and commit code; they never push or open PRs (no GitHub
-  credentials reach the sandbox).
+  credentials reach them: `guard/` refuses `git push` and `gh`).
 * The reviewer judges code, never writes git state; its verdict never merges
   anything.
 * You (the orchestrating session) drive the skills but never write or commit

@@ -25,18 +25,10 @@ REPOS=(.)
 # use opencode's own default/configured model.
 # OPENCODE_MODEL="anthropic/claude-sonnet-5"
 
-# Commit identity for work done inside the sandbox. Scoped to the container
-# only — never touches the host's git config.
+# Commit identity for dispatched workers. Passed as GIT_AUTHOR_*/GIT_COMMITTER_*
+# env vars to the worker process only — never touches the host's git config.
 # AGENT_GIT_NAME="myproject-bot"
 # AGENT_GIT_EMAIL="bot@users.noreply.github.com"
-
-# ag-sbx (https://github.com/shramee/agent-sandbox) must be installed and on
-# PATH. It pulls shramee/agent-sandbox:latest by default, which does NOT
-# include opencode — point AG_SBX_IMAGE_OVERRIDE at a derivative image built
-# from docker/Dockerfile in this repo (FROM shramee/agent-sandbox + opencode +
-# the quality tools) before dispatching anything.
-# AG_SBX_IMAGE_OVERRIDE="yourorg/ai-sdlc-sandbox:latest"
-# AG_SBX_BIN="ag-sbx"
 
 # Where logs and host-side worktrees live. Default: <project>/.sdlc/{logs,worktrees}
 # STATE_DIR=".sdlc"

@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Aggressive senior-engineer code review. Use before merging any branch a dispatched worker produced, and again after every remediation. Adversarial by design — finds gaps, does not confirm success. Read-only against git state; never enters the sandbox.
+description: Aggressive senior-engineer code review. Use before merging any branch a dispatched worker produced, and again after every remediation. Adversarial by design — finds gaps, does not confirm success. Read-only against git state; never touches the worker's worktree.
 tools: Read, Grep, Glob, Bash
 model: opus
 ---

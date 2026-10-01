@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
-# ai-sdlc — the MECHANICS layer: git/docker/gh plumbing + the quality gate.
+# ai-sdlc — the MECHANICS layer: git/gh plumbing + the quality gate.
 # No judgment — that lives in .claude/skills/*/SKILL.md (process) and
 # .claude/agents/reviewer.md (code). See README.md.
 #
-# Backend: workers run `opencode` inside an
-# https://github.com/shramee/agent-sandbox container via `ag-sbx`, which
-# bind-mounts directories at the identical path as on the host — so
-# host-created git worktrees resolve from both sides. Create worktrees on the
-# host, cd into them, hand off to ag-sbx. See docker/README.md.
+# Backend: workers run `opencode` directly on the host, inside a per-branch git
+# worktree. No container: isolation is the worktree (never the default branch)
+# plus guard/ shims that refuse `git push` and `gh` for the worker.
 #
 # Usage: ai-sdlc <subcommand> [args...]
 #
 #   dispatch <repo> <branch> "<prompt>" [extra opencode flags...]
-#       Host worktree for <branch> + ag-sbx container + `opencode run --auto`
-#       with subagent-instructions.md appended. Tracks a GitHub issue
+#       Host worktree for <branch> + `opencode run --auto` in it, with
+#       subagent-instructions.md appended. Tracks a GitHub issue
 #       (status:dispatched), best-effort. Worker commits locally; never pushes.
 #   vibe <repo> <branch>
-#       Same worktree/container setup, interactive session for a human.
+#       Same worktree, interactive opencode session for a human.
 #   review-context <repo> <branch>
 #       Read-only bundle (diff, log, tracked issue, open PR) for the reviewer.
 #   quality <repo> [branch]
@@ -29,13 +27,11 @@
 #       Pull merged default branches; in submodule projects, stage+commit the
 #       moved pointer in the parent (never pushes it).
 #   status
-#       Read-only fleet view: branches, ahead counts, live containers, PRs.
+#       Read-only fleet view: branches, ahead counts, running workers, PRs.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
 #       Work a branch directly on the host; no branch = interactive picker.
 #   restore <repo> [--stash|--reset|--wip]
 #       Switch back to the default branch. Same dirty-tree handling as checkout.
-#   container <repo> [build|deploy|update|clean|status]
-#       Thin proxy to `ag-sbx` for the repo's default checkout.
 #   config | init [dir]
 #       Print / write sdlc.conf; resolved by walking up from $PWD
 #       (or $SDLC_PROJECT; $SDLC_CONFIG overrides).
@@ -88,17 +84,12 @@ load_config() {
     PROJECT_NAME="$(basename "$PROJECT_ROOT")"
     REPOS=(.)
     AGENT_BRANCH_PREFIX="agent/"
-    # opencode invocation. dispatch appends `--dir "<worktree>" "<prompt>"`
-    # (plus any extra flags passed on the command line); vibe drops --auto.
+    # opencode invocation, run from inside the worktree. dispatch appends the
+    # prompt (plus any extra flags passed on the command line); vibe drops it.
     OPENCODE_CMD=(opencode run --auto --format json)
     OPENCODE_MODEL=""
     AGENT_GIT_NAME=""
     AGENT_GIT_EMAIL=""
-    # ag-sbx pulls this image by default. Set AG_SBX_IMAGE_OVERRIDE to build a
-    # project-specific derivative (e.g. via docker/Dockerfile in this repo,
-    # which layers opencode + the quality tools onto shramee/agent-sandbox).
-    AG_SBX_IMAGE_OVERRIDE=""
-    AG_SBX_BIN="ag-sbx"
     STATE_DIR=""
     LOGS_DIR=""
     WORKTREES_DIR=""
@@ -348,67 +339,39 @@ $prompt" >/dev/null 2>&1 || true
     echo "$issue_num"
 }
 
-# ------------------------------------------------------------ ag-sbx glue --
-# ag-sbx keys containers off the directory it's run FROM, hashing the exact
-# path. That's the whole trick this design leans on: run it from a host git
-# worktree and the container mounts that worktree at the identical path, so a
-# worktree's .git pointer (an absolute path) resolves the same from both
-# sides. No /workspace translation layer, no container-side worktree
-# creation, no locking against a host-side prune.
-require_ag_sbx() {
-    command -v "$AG_SBX_BIN" >/dev/null 2>&1 \
-        || die "$AG_SBX_BIN not found on PATH — install https://github.com/shramee/agent-sandbox (./install.sh)"
+# ------------------------------------------------------------ worker glue ---
+require_opencode() {
+    command -v "${OPENCODE_CMD[0]}" >/dev/null 2>&1 \
+        || die "${OPENCODE_CMD[0]} not found on PATH — install https://opencode.ai"
 }
 
-ag_sbx_env() {
-    # Exported once per call site so `ag-sbx` and `docker` subshells see it.
-    [ -n "$AG_SBX_IMAGE_OVERRIDE" ] && export AG_SBX_IMAGE="$AG_SBX_IMAGE_OVERRIDE"
+# Runs "$@" as a worker: from inside the worktree, with the agent's commit
+# identity (env only — never touches the host's git config) and guard/ first on
+# PATH so the worker's `git push` and `gh` are refused. A guard against
+# accidents, not an adversary: `/usr/bin/git push` still works.
+run_worker() {
+    local worktree="$1"; shift
+    (
+        cd "$worktree"
+        if [ -n "$AGENT_GIT_NAME" ]; then
+            export GIT_AUTHOR_NAME="$AGENT_GIT_NAME" GIT_COMMITTER_NAME="$AGENT_GIT_NAME"
+        fi
+        if [ -n "$AGENT_GIT_EMAIL" ]; then
+            export GIT_AUTHOR_EMAIL="$AGENT_GIT_EMAIL" GIT_COMMITTER_EMAIL="$AGENT_GIT_EMAIL"
+        fi
+        export AI_SDLC_GUARD_DIR="$SDLC_HOME/guard"
+        export PATH="$AI_SDLC_GUARD_DIR:$PATH"
+        "$@"
+    )
 }
 
-container_name_for_dir() {
-    # Mirror ag-sbx's own naming (sbx-<5 of dirname>-<4 hex of path>) so we can
-    # `docker exec`/`docker cp` against it directly without re-invoking ag-sbx
-    # for every single step of a dispatch.
-    local dir="$1" dname hash
-    dname="$(basename "$dir" | tr -cd 'A-Za-z0-9_.-' | cut -c1-5 | tr 'A-Z' 'a-z')"
-    hash="$(printf '%s' "$dir" | shasum -a 256 | cut -c1-4)"
-    echo "sbx-${dname}-${hash}"
-}
-
-# opencode's auth lives in ~/.local/share/opencode/auth.json (small) next to a
-# multi-GB local db (opencode.db) we must NOT mount or copy wholesale. `ag-sbx`
-# doesn't know about opencode, so rather than fork it, sync just the
-# credential + config files in with `docker cp` after ag-sbx has the
-# container up — works regardless of ag-sbx's own mount set, and never touches
-# the referenced repo.
-sync_opencode_credentials() {
-    local container="$1"
-    local auth="$HOME/.local/share/opencode/auth.json"
-    local cfg="$HOME/.config/opencode/opencode.json"
-    docker exec "$container" mkdir -p /home/agent/.local/share/opencode /home/agent/.config/opencode
-    [ -f "$auth" ] && docker cp "$auth" "$container:/home/agent/.local/share/opencode/auth.json"
-    [ -f "$cfg" ] && docker cp "$cfg" "$container:/home/agent/.config/opencode/opencode.json"
-    docker exec "$container" chown -R agent:agent /home/agent/.local/share/opencode /home/agent/.config/opencode 2>/dev/null || true
-}
-
-# Ensures the ag-sbx container for $1 (a directory) is up, with opencode
-# credentials synced and the agent git identity set. Echoes its container name.
-ensure_worker_container() {
-    local dir="$1"
-    require_ag_sbx
-    ag_sbx_env
-    ( cd "$dir" && "$AG_SBX_BIN" -- true )
-    local container; container="$(container_name_for_dir "$dir")"
-    sync_opencode_credentials "$container"
-    [ -n "$AGENT_GIT_NAME" ] && docker exec "$container" git config --global user.name "$AGENT_GIT_NAME"
-    [ -n "$AGENT_GIT_EMAIL" ] && docker exec "$container" git config --global user.email "$AGENT_GIT_EMAIL"
-    docker exec "$container" git config --global --add safe.directory '*' || true
-    echo "$container"
-}
+# pidfile for the running dispatch, so `status` can tell a live worker from a
+# dead one.
+pidfile_for() { echo "$LOGS_DIR/$1-${2//\//-}.pid"; }
 
 # ------------------------------------------------------------- dispatch ----
-# Host-side worktree: no container involvement in its creation, so plain git
-# handles staleness/pruning normally. Sets (non-local) WORKTREE, LOG_FILE.
+# Host-side worktree, so plain git handles staleness/pruning normally.
+# Sets (non-local) WORKTREE, LOG_FILE.
 prepare_worktree() {
     local REPO="$1" BRANCH="$2"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -477,16 +440,21 @@ cmd_dispatch() {
 
 $instructions"
 
-    local container; container="$(ensure_worker_container "$WORKTREE")"
-
+    require_opencode
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
 
-    docker exec -w "$WORKTREE" "$container" \
-        "${OPENCODE_CMD[@]}" "${model_flags[@]}" "$@" --dir "$WORKTREE" -- "$FULL_PROMPT" \
-        2>&1 | tee -a "$LOG_FILE"
+    local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
+    echo $$ > "$pidfile"
+    trap "rm -f '$pidfile'" EXIT
+
+    # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
+    local rc=0
+    run_worker "$WORKTREE" "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} "$@" -- "$FULL_PROMPT" \
+        </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
 
     echo "" >> "$LOG_FILE"
+    return "$rc"
 }
 
 cmd_vibe() {
@@ -496,12 +464,12 @@ cmd_vibe() {
 
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
-    local container; container="$(ensure_worker_container "$WORKTREE")"
+    require_opencode
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
 
-    local cmd="docker exec -it -w \"$WORKTREE\" $container opencode ${model_flags[*]}"
+    local cmd="cd \"$WORKTREE\" && opencode ${model_flags[*]:-}"
     echo "Opening interactive opencode session for $REPO:$BRANCH..."
     open_terminal "vibe:$REPO/$BRANCH" "$cmd"
 }
@@ -715,7 +683,7 @@ cmd_checkout() {
 
     echo ""
     echo "$REPO is now on $BRANCH (created/resumed off $default_branch) for direct work"
-    echo "on the host — no container worker dispatched."
+    echo "on the host — no worker dispatched."
     echo "Follow $SUBAGENT_INSTRUCTIONS: stage everything (git add .) and"
     echo "commit early and often as steps complete."
     echo "Run 'ai-sdlc restore $REPO' when done; a later 'ai-sdlc dispatch' on this"
@@ -738,26 +706,6 @@ cmd_restore() {
     echo "$REPO restored to $default_branch"
 }
 
-# ---------------------------------------------------------------- container
-cmd_container() {
-    local USAGE_LINE="usage: ai-sdlc container <repo> [build|deploy|update|clean|status]"
-    local REPO="${1:?$USAGE_LINE}"
-    local ACTION="${2:-status}"
-    local dir; dir="$(require_repo "$REPO")" || exit 1
-    require_ag_sbx
-    ag_sbx_env
-    case "$ACTION" in
-        status)
-            local container; container="$(container_name_for_dir "$dir")"
-            docker ps -a --filter "name=^${container}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-            ;;
-        build|deploy|update|clean)
-            ( cd "$dir" && "$AG_SBX_BIN" "$ACTION" )
-            ;;
-        *) die "usage: $USAGE_LINE" ;;
-    esac
-}
-
 # --------------------------------------------------------------- status ----
 cmd_status() {
     for repo in "${REPOS[@]}"; do
@@ -777,10 +725,10 @@ cmd_status() {
             ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
             local label; label="$(repo_label_of "$repo")"
             local wt="$WORKTREES_DIR/$label/${br//\//-}"
-            local live=""
+            local live="" pid
             if [ -d "$wt" ]; then
-                local cname; cname="$(container_name_for_dir "$wt")"
-                docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cname" && live=" [container: $cname running]"
+                pid="$(cat "$(pidfile_for "$label" "$br")" 2>/dev/null || true)"
+                [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && live=" [worker running, pid $pid]"
             fi
             echo "  branch $br: $ahead commit(s) ahead of $default_branch$live"
         done
@@ -801,7 +749,6 @@ project root: $PROJECT_ROOT
 repos       : ${REPOS[*]}
 branch prefix: $AGENT_BRANCH_PREFIX
 opencode cmd: ${OPENCODE_CMD[*]} ${OPENCODE_MODEL:+--model $OPENCODE_MODEL}
-ag-sbx bin  : $AG_SBX_BIN $([ -n "$AG_SBX_IMAGE_OVERRIDE" ] && echo "(AG_SBX_IMAGE=$AG_SBX_IMAGE_OVERRIDE)" || echo "(default image)")
 logs        : $LOGS_DIR
 worktrees   : $WORKTREES_DIR
 instructions: $SUBAGENT_INSTRUCTIONS
@@ -822,7 +769,7 @@ cmd_init() {
     local conf="$target/sdlc.conf"
     [ -e "$conf" ] && die "$conf already exists"
     cp "$SDLC_HOME/examples/sdlc.conf.example" "$conf"
-    echo "Wrote $conf — edit REPOS / test_cmd_for / AG_SBX_IMAGE_OVERRIDE, then run 'ai-sdlc config'."
+    echo "Wrote $conf — edit REPOS / test_cmd_for / OPENCODE_MODEL, then run 'ai-sdlc config'."
 }
 
 # ----------------------------------------------------------------- main ----
@@ -846,7 +793,6 @@ case "$SUBCOMMAND" in
     status)         cmd_status "$@" ;;
     checkout)       cmd_checkout "$@" ;;
     restore)        cmd_restore "$@" ;;
-    container)      cmd_container "$@" ;;
     config)         cmd_config "$@" ;;
     *) echo "unknown subcommand: $SUBCOMMAND" >&2; usage ;;
 esac
