@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Worker guard: dispatched workers get no GitHub access (see guard/git).
+echo "!! gh is blocked for dispatched workers — the host opens PRs (ai-sdlc ship)." >&2
+exit 1

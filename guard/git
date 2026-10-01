@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Worker guard: ai-sdlc puts this dir first on PATH for dispatched workers.
+# Workers commit locally and never push — refuse `git push`, pass the rest
+# through to the real git. A guard against accidents, not an adversary.
+set -euo pipefail
+
+args=("$@")
+i=0
+while [ "$i" -lt "$#" ]; do
+    case "${args[$i]}" in
+        -C|-c|--git-dir|--work-tree|--namespace|--exec-path) i=$((i + 2)) ;;
+        -*) i=$((i + 1)) ;;
+        *) break ;;
+    esac
+done
+if [ "${args[$i]:-}" = "push" ]; then
+    echo "!! git push is blocked for dispatched workers — commit locally; the host ships (ai-sdlc ship)." >&2
+    exit 1
+fi
+
+PATH="${PATH#"${AI_SDLC_GUARD_DIR:-/nonexistent}":}" exec git "$@"
