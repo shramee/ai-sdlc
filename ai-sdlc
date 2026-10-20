@@ -21,8 +21,10 @@
 #       quality/grade.sh (lizard + jscpd) grade; thresholds.conf is the gate.
 #   ship [branch]
 #       Host-side (needs `gh`): per agent branch ahead of default, run the
-#       repo's test command AND the quality gate; push + open/update PR only
-#       if both green. Failing branches are left unpushed for a fix-up dispatch.
+#       repo's test command AND the quality gate in the branch's worktree;
+#       push + open/update PR only if both green. Failing branches are left
+#       unpushed for a fix-up dispatch (exit 1); tips whose PR was already
+#       closed/merged are skipped.
 #   sync [repo ...]
 #       Pull merged default branches; in submodule projects, stage+commit the
 #       moved pointer in the parent (never pushes it).
@@ -365,11 +367,48 @@ run_worker() {
     )
 }
 
+# Project thresholds override the tool's defaults — one or the other, never a
+# fallback, or failing the project's gate would just retry on the laxer one.
+thresholds_file() {
+    if [ -f "$PROJECT_ROOT/quality/thresholds.conf" ]; then
+        echo "$PROJECT_ROOT/quality/thresholds.conf"
+    else
+        echo "$SDLC_HOME/quality/thresholds.conf"
+    fi
+}
+
 # pidfile for the running dispatch, so `status` can tell a live worker from a
 # dead one.
 pidfile_for() { echo "$LOGS_DIR/$1-${2//\//-}.pid"; }
 
 # ------------------------------------------------------------- dispatch ----
+# Create (or resume) the worktree at <worktree> for <branch>, branching off
+# origin/<default> when the branch doesn't exist yet.
+ensure_worktree() {
+    local dir="$1" worktree="$2" branch="$3" default_branch="$4"
+    if [ -d "$worktree" ] && git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Resuming worktree $worktree"
+        return 0
+    fi
+    [ -d "$worktree" ] && { rm -rf "$worktree"; git -C "$dir" worktree prune; }
+    echo "Creating worktree $worktree"
+    if git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$dir" worktree add "$worktree" "$branch"
+    else
+        git -C "$dir" worktree add -b "$branch" "$worktree" "origin/$default_branch"
+    fi
+}
+
+# Where <branch> is checked out right now, if anywhere: a dispatch worktree,
+# or the repo's own checkout after `ai-sdlc checkout`. The main worktree is
+# reported as <dir> itself — for submodules git may list it by its gitdir.
+worktree_of_branch() {
+    local dir="$1" branch="$2"
+    git -C "$dir" worktree list --porcelain | awk -v ref="refs/heads/$branch" -v main="$dir" '
+        /^worktree / { n++; wt = substr($0, 10) }
+        $0 == "branch " ref { print (n == 1 ? main : wt); exit }'
+}
+
 # Host-side worktree, so plain git handles staleness/pruning normally.
 # Sets (non-local) WORKTREE, LOG_FILE.
 prepare_worktree() {
@@ -386,17 +425,7 @@ prepare_worktree() {
     git -C "$dir" fetch origin 2>&1 | tee -a "$LOG_FILE"
     local default_branch; default_branch="$(default_branch_of "$dir")"
 
-    if [ -d "$WORKTREE" ] && git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1; then
-        echo "Resuming worktree $WORKTREE" | tee -a "$LOG_FILE"
-    else
-        [ -d "$WORKTREE" ] && { rm -rf "$WORKTREE"; git -C "$dir" worktree prune; }
-        echo "Creating worktree $WORKTREE" | tee -a "$LOG_FILE"
-        if git -C "$dir" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-            git -C "$dir" worktree add "$WORKTREE" "$BRANCH" 2>&1 | tee -a "$LOG_FILE"
-        else
-            git -C "$dir" worktree add -b "$BRANCH" "$WORKTREE" "origin/$default_branch" 2>&1 | tee -a "$LOG_FILE"
-        fi
-    fi
+    ensure_worktree "$dir" "$WORKTREE" "$BRANCH" "$default_branch" 2>&1 | tee -a "$LOG_FILE"
 
     ln -sf "$LOG_FILE" "$WORKTREE/agent.log"
     local gitdir; gitdir="$(git -C "$WORKTREE" rev-parse --git-common-dir)"
@@ -449,11 +478,21 @@ $instructions"
     trap "rm -f '$pidfile'" EXIT
 
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
-    local rc=0
+    local rc=0 log_start
+    log_start="$(wc -l < "$LOG_FILE")"
     run_worker "$WORKTREE" "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} "$@" -- "$FULL_PROMPT" \
         </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
 
     echo "" >> "$LOG_FILE"
+    # opencode reports provider/auth failures as JSON events buried in the
+    # stream; surface the last one so a dead run isn't mistaken for a quiet one.
+    local err
+    err="$(tail -n +"$((log_start + 1))" "$LOG_FILE" | grep '"type":"error"' | tail -n1 \
+        | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' || true)"
+    if [ -n "$err" ] || [ "$rc" -ne 0 ]; then
+        echo "!! worker failed (rc=$rc): ${err:-see $LOG_FILE}" >&2
+        [ "$rc" -ne 0 ] || rc=1
+    fi
     return "$rc"
 }
 
@@ -515,34 +554,58 @@ cmd_quality() {
     local REPO="${1:?$USAGE_LINE}"
     local BRANCH="${2:-}"
     local dir; dir="$(require_repo "$REPO")" || exit 1
-    local thresholds="$PROJECT_ROOT/quality/thresholds.conf"
-    [ -f "$thresholds" ] || thresholds="$SDLC_HOME/quality/thresholds.conf"
-    "$SDLC_HOME/quality/grade.sh" "$dir" "$BRANCH" "$thresholds"
+    # Grade the branch's own tree, not whatever the repo has checked out.
+    if [ -n "$BRANCH" ]; then
+        local wt; wt="$(worktree_of_branch "$dir" "$BRANCH")"
+        [ -n "$wt" ] || die "$REPO:$BRANCH isn't checked out anywhere — dispatch or checkout it first"
+        dir="$wt"
+    fi
+    "$SDLC_HOME/quality/grade.sh" "$dir" "$BRANCH" "$(thresholds_file)"
 }
 
 # ----------------------------------------------------------------- ship ----
 cmd_ship() {
     local FILTER_BRANCH="${1:-}"
 
+    # Validates in the worktree that has <br> checked out (creating the
+    # dispatch one if none does), so the repo's own checkout is never moved —
+    # it can't be anyway: git refuses a branch another worktree holds.
     ship_one() {
         local dir="$1" br="$2" default_branch="$3" repo="$4"
-        git -C "$dir" checkout "$br" || return 1
+        local wt; wt="$(worktree_of_branch "$dir" "$br")"
+        if [ -z "$wt" ]; then
+            wt="$WORKTREES_DIR/$(repo_label_of "$repo")/${br//\//-}"
+            mkdir -p "$(dirname "$wt")"
+            ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+        fi
+        if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no)" ]; then
+            echo "!! $wt has uncommitted changes — commit them (or dispatch a fix-up) first:"
+            git -C "$wt" status --short --untracked-files=no
+            return 1
+        fi
 
         local cmd
-        cmd="$(validation_cmd_for "$repo" "$dir")"
+        cmd="$(validation_cmd_for "$repo" "$wt")"
         if [ -z "$cmd" ]; then
             echo "!! no validation command for $repo — define test_cmd_for in $CONFIG_FILE"
             return 1
         fi
-        echo "-- validating: $cmd"
-        if ! (cd "$dir" && eval "$cmd"); then
+        echo "-- validating in $wt: $cmd"
+        local untracked_before vrc=0
+        untracked_before="$(git -C "$wt" ls-files --others --exclude-standard --directory)"
+        (cd "$wt" && eval "$cmd") || vrc=$?
+        # Drop what validation itself left behind (build output, lockfiles) so
+        # a re-dispatched worker's `git add .` can't commit it.
+        comm -13 <(echo "$untracked_before" | sort) \
+            <(git -C "$wt" ls-files --others --exclude-standard --directory | sort) \
+            | while IFS= read -r f; do [ -n "$f" ] && rm -rf "${wt:?}/$f"; done
+        if [ "$vrc" -ne 0 ]; then
             echo "!! validation failed for $repo:$br — not pushing"
             return 1
         fi
 
         echo "-- quality gate"
-        if ! "$SDLC_HOME/quality/grade.sh" "$dir" "$br" "${PROJECT_ROOT}/quality/thresholds.conf" 2>/dev/null \
-            && ! "$SDLC_HOME/quality/grade.sh" "$dir" "$br" "$SDLC_HOME/quality/thresholds.conf"; then
+        if ! "$SDLC_HOME/quality/grade.sh" "$wt" "$br" "$(thresholds_file)"; then
             echo "!! quality gate failed for $repo:$br — not pushing (see docs/REVIEW.md)"
             return 1
         fi
@@ -580,13 +643,14 @@ Closes #$issue_num"
         echo "$pr_out"
     }
 
+    local failed=()
     for repo in "${REPOS[@]}"; do
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
 
-        local default_branch orig_branch
+        local default_branch slug
         default_branch="$(default_branch_of "$dir")"
-        orig_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+        slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
 
         local branches=()
         while IFS= read -r line; do branches+=("$line"); done \
@@ -602,15 +666,30 @@ Closes #$issue_num"
             ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
             [ "$ahead" -eq 0 ] && continue
 
-            echo "== $repo : $br ($ahead commit(s) ahead of $default_branch) =="
-            if ! ship_one "$dir" "$br" "$default_branch" "$repo"; then
-                echo "!! failed for $repo:$br (checkout/validate/quality/push/PR) — not proceeding further on this branch"
+            # Squash-merged or rejected branches stay "ahead" forever; a PR
+            # already closed/merged at this exact tip means it was decided.
+            local tip decided
+            tip="$(git -C "$dir" rev-parse "$br")"
+            decided="$(gh -R "$slug" pr list --head "$br" --state all --json number,state,headRefOid \
+                --jq ".[] | select(.headRefOid == \"$tip\" and .state != \"OPEN\") | \"#\(.number) \(.state)\"" \
+                2>/dev/null | head -n1 || true)"
+            if [ -n "$decided" ]; then
+                echo "skip $repo:$br — PR $decided at this tip (delete the branch, or add commits to reship)"
+                continue
             fi
 
-            git -C "$dir" checkout "$orig_branch" \
-                || echo "!! could not restore $repo to $orig_branch — left on whatever ship_one last checked out"
+            echo "== $repo : $br ($ahead commit(s) ahead of $default_branch) =="
+            if ! ship_one "$dir" "$br" "$default_branch" "$repo"; then
+                echo "!! failed for $repo:$br (validate/quality/push/PR) — not proceeding further on this branch"
+                failed+=("$repo:$br")
+            fi
         done
     done
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        echo "!! not shipped: ${failed[*]}" >&2
+        return 1
+    fi
 }
 
 # ----------------------------------------------------------------- sync ----
@@ -656,7 +735,8 @@ cmd_sync() {
         return 0
     fi
 
-    git -C "$PROJECT_ROOT" commit -m "chore: sync ${updated[*]} to latest upstream"
+    # Pathspec: commit only the moved pointers, not whatever else is staged.
+    git -C "$PROJECT_ROOT" commit -m "chore: sync ${updated[*]} to latest upstream" -- "${updated[@]}"
     echo "Committed parent repo update for: ${updated[*]}"
     echo "Review with 'git show', then push manually when ready."
 }
@@ -735,8 +815,10 @@ cmd_status() {
 
         local slug
         slug="$(repo_slug_of "$dir")"
+        # Go templates don't unescape "\n" — the newline must be literal.
         gh -R "$slug" pr list --json number,title,headRefName,state \
-            --template '{{range .}}  PR #{{.number}} [{{.state}}] {{.headRefName}}: {{.title}}\n{{end}}' 2>/dev/null || echo "  (could not list PRs)"
+            --template '{{range .}}  PR #{{.number}} [{{.state}}] {{.headRefName}}: {{.title}}
+{{end}}' 2>/dev/null || echo "  (could not list PRs)"
     done
 }
 

@@ -54,16 +54,21 @@ LIZARD_TARGET=(.)
 [ "${#SCOPE_FILES[@]}" -gt 0 ] && LIZARD_TARGET=("${SCOPE_FILES[@]}")
 
 LIZARD_CSV="$(mktemp -t lizard-XXXX.csv)"
-lizard --csv "${LIZARD_EXCLUDE[@]}" "${LIZARD_TARGET[@]}" > "$LIZARD_CSV" 2>/dev/null || true
+# A branch that touches no surviving files has nothing to grade — don't fall
+# back to the whole tree and fail it for code it never touched.
+if [ -z "$BRANCH" ] || [ "${#SCOPE_FILES[@]}" -gt 0 ]; then
+    lizard --csv "${LIZARD_EXCLUDE[@]}" "${LIZARD_TARGET[@]}" > "$LIZARD_CSV" 2>/dev/null || true
+fi
 
 JSCPD_OUT="$(mktemp -d -t jscpd-XXXX)"
 jscpd --silent --reporters json --ignore "$JSCPD_IGNORE" --output "$JSCPD_OUT" . >/dev/null 2>&1 || true
 JSCPD_JSON="$JSCPD_OUT/jscpd-report.json"
 [ -f "$JSCPD_JSON" ] || echo '{"statistics":{"total":{"percentage":0}}}' > "$JSCPD_JSON"
 
+RC=0
 python3 - "$LIZARD_CSV" "$JSCPD_JSON" "$MAX_CCN" "$HARD_MAX_CCN" "$MAX_FUNC_LENGTH" "$MAX_PARAMS" \
     "$MAX_DUPLICATION_PCT" "$MIN_PASSING_SCORE" "$DEDUCT_PER_CCN_VIOLATION" \
-    "$DEDUCT_PER_LENGTH_VIOLATION" "$DEDUCT_PER_PARAM_VIOLATION" <<'PYEOF'
+    "$DEDUCT_PER_LENGTH_VIOLATION" "$DEDUCT_PER_PARAM_VIOLATION" <<'PYEOF' || RC=$?
 import csv, json, sys
 
 (lizard_csv, jscpd_json, max_ccn, hard_max_ccn, max_len, max_params, max_dup,
@@ -126,7 +131,6 @@ passed = score >= min_score and not hard_blockers
 print(f"gate: {'PASS' if passed else 'FAIL'} (min score {min_score})")
 sys.exit(0 if passed else 1)
 PYEOF
-RC=$?
 rm -f "$LIZARD_CSV"
 rm -rf "$JSCPD_OUT"
 exit "$RC"
