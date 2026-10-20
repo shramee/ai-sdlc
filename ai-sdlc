@@ -470,8 +470,12 @@ cmd_dispatch() {
 $instructions"
 
     require_opencode
-    local model_flags=()
+    # A per-dispatch -m/--model wins over the configured default.
+    local model_flags=() arg
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
+    for arg in "$@"; do
+        case "$arg" in -m|--model|--model=*) model_flags=() ;; esac
+    done
 
     local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
     echo $$ > "$pidfile"
