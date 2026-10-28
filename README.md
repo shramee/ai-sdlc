@@ -59,6 +59,7 @@ Then, in a consuming project:
 cd ~/code/myproject
 ai-sdlc init                 # writes sdlc.conf — edit REPOS / test_cmd_for / OPENCODE_MODEL
 ai-sdlc config               # check what resolved
+ai-sdlc doctor               # tools, gh auth, model, CI drift, stale state
 ai-sdlc status               # read-only fleet view
 ```
 
@@ -80,10 +81,41 @@ identity comes from `AGENT_GIT_NAME`/`AGENT_GIT_EMAIL` as per-process env vars,
 so the host's git config is untouched. `guard/` is first on the worker's PATH
 and refuses `git push` and `gh`, so workers commit locally and the host ships.
 
+One worker per worktree: `dispatch` takes a lock (a directory holding the
+PID and start time, inside the worktree's git dir) and refuses while a live
+process holds it; a lock left by a dead process is cleared with a notice.
+`ship` and `vibe` refuse a locked worktree too.
+
 That is a guard against accidents, not a sandbox: the worker runs as you, can
 read and write anything you can, and `/usr/bin/git push` still works. If you
 need real isolation (untrusted prompts or models), run `ai-sdlc` itself inside
 a VM or container of your own.
+
+## What the mechanics check
+
+- **dispatch** succeeds only if the run made at least one commit on the
+  branch and left a clean tree (no uncommitted or untracked files); otherwise
+  it exits non-zero and keeps the worktree for a resume. A resumed branch is
+  used as-is (never rebased) and dispatch prints how far behind
+  `origin/<default>` it is; a branch whose PR already merged at its tip is
+  refused. A re-dispatch continues the branch's last opencode session
+  (`DISPATCH_RESUME_SESSION=0` starts fresh); `DISPATCH_TIMEOUT` caps
+  wall-clock seconds.
+- **ship** fetches first, then validates each branch in the worktree that has
+  it checked out — the dispatch worktree, or the repo's own checkout in
+  `checkout` mode — never the default checkout. It refuses a tree with
+  uncommitted or untracked files (tests would pass on files the push omits),
+  a live worker, or a gh error while checking for an existing PR. It never
+  deletes files. `ship --dry-run` prints the plan. A bare `ship` considers
+  branches under `AGENT_BRANCH_PREFIX` (space-separated, default `agent/`);
+  `ship <branch>` ships any local branch.
+- **sync** fast-forwards each default branch without moving whatever is
+  checked out, commits only the submodule pointers that actually changed,
+  and asks GitHub which agent branches merged; `--delete-merged` removes them
+  and their worktrees.
+- **prune** (dry run unless `--yes`) removes worktrees of merged/closed PRs
+  and logs older than `PRUNE_LOG_DAYS`; **doctor** reports what's missing or
+  stale without changing anything.
 
 ## Quality gate
 
@@ -91,7 +123,10 @@ a VM or container of your own.
 (per-function complexity, length, parameter count) and
 [jscpd](https://github.com/kucherenko/jscpd) (cross-file duplication), rolled
 into a 0–10 / A–F score against `quality/thresholds.conf`, with a hard
-ceiling on any single function's complexity. No SaaS account; same in CI, in
+ceiling on any single function's complexity. Given a branch, the per-function
+metrics cover only the files that branch touches; duplication is measured
+across the whole tree, since a clone pair isn't a property of one file (the
+`quality/grade.sh` header is authoritative). No SaaS account; same in CI, in
 `ai-sdlc ship`, and inside the reviewer's own review. What the grade means:
 `docs/REVIEW.md`.
 
@@ -106,7 +141,7 @@ verdict is evidence for a human code owner, never a merge decision —
 ## Layout
 
 ```
-ai-sdlc                      mechanics: dispatch/ship/sync/status/checkout/quality
+ai-sdlc                      mechanics: dispatch/ship/sync/status/doctor/prune/checkout/quality
 subagent-instructions.md     appended to every dispatch prompt
 examples/sdlc.conf.example   starter config, copied by `ai-sdlc init`
 guard/                       PATH shims that refuse `git push` and `gh` for dispatched workers
