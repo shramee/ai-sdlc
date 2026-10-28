@@ -13,9 +13,11 @@
 # monorepo-of-repos. Default: (.)
 REPOS=(.)
 
-# Branch prefix that marks a branch as agent work — `ship` and `status` only
-# ever look at branches under it. Default: "agent/"
-# AGENT_BRANCH_PREFIX="agent/"
+# Branch prefixes that mark a branch as agent work, space-separated. A bare
+# `ship` considers only branches under one of them (`ship <branch>` ships any
+# local branch); `status` lists them plus whatever a dispatch worktree holds.
+# Default: "agent/"
+# AGENT_BRANCH_PREFIX="agent/ fix/ feat/"
 
 # The opencode invocation, as an argv array (before the repo/model flags
 # `dispatch` appends). Default: (opencode run --auto --format json)

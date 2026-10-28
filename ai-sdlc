@@ -19,12 +19,13 @@
 #       Read-only bundle (diff, log, tracked issue, open PR) for the reviewer.
 #   quality <repo> [branch]
 #       quality/grade.sh (lizard + jscpd) grade; thresholds.conf is the gate.
-#   ship [branch]
-#       Host-side (needs `gh`): per agent branch ahead of default, run the
-#       repo's test command AND the quality gate in the branch's worktree;
-#       push + open/update PR only if both green. Failing branches are left
-#       unpushed for a fix-up dispatch (exit 1); tips whose PR was already
-#       closed/merged are skipped.
+#   ship [--dry-run] [branch]
+#       Host-side (needs `gh`): fetch, then per agent branch ahead of default,
+#       run the repo's test command AND the quality gate in the branch's
+#       worktree; push + open/update PR only if both green. Refuses a branch
+#       with uncommitted/untracked files or a live worker. Failing branches
+#       are left unpushed for a fix-up dispatch (exit 1); tips whose PR was
+#       already closed/merged are skipped. --dry-run prints the plan only.
 #   sync [repo ...]
 #       Pull merged default branches; in submodule projects, stage+commit the
 #       moved pointer in the parent (never pushes it).
@@ -447,6 +448,40 @@ release_lock() {
 }
 
 # ------------------------------------------------------------- dispatch ----
+# Local branches under any of AGENT_BRANCH_PREFIX's space-separated prefixes.
+agent_branches() {
+    local dir="$1" p prefixes
+    read -ra prefixes <<<"$AGENT_BRANCH_PREFIX"
+    for p in "${prefixes[@]}"; do
+        git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$p"
+    done | sort -u
+}
+
+# Branches checked out in dispatch worktrees (under WORKTREES_DIR), whatever
+# their prefix.
+dispatch_worktree_branches() {
+    local root; root="$(cd -P "$WORKTREES_DIR" 2>/dev/null && pwd)" || return 0
+    git -C "$1" worktree list --porcelain | awk -v root="$root/" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch refs\/heads\// { if (index(wt, root) == 1) print substr($0, 19) }'
+}
+
+# JSON array of every PR (any state) whose head is <branch>. Fails loudly: a
+# gh error must never read as "no PR".
+prs_for_branch() {
+    local slug="$1" br="$2" out
+    if [ -z "$slug" ]; then
+        echo "!! no GitHub slug for origin — can't look up PRs for $br" >&2
+        return 1
+    fi
+    if ! out="$(gh pr list -R "$slug" --head "$br" --state all -L 50 \
+        --json number,state,headRefOid,url 2>&1)"; then
+        echo "!! gh pr list failed for $slug:$br: $out" >&2
+        return 1
+    fi
+    echo "$out"
+}
+
 # Create (or resume) the worktree at <worktree> for <branch>, branching off
 # origin/<default> when the branch doesn't exist yet.
 ensure_worktree() {
@@ -635,28 +670,50 @@ cmd_quality() {
 
 # ----------------------------------------------------------------- ship ----
 cmd_ship() {
-    local FILTER_BRANCH="${1:-}"
+    local USAGE_LINE="usage: ai-sdlc ship [--dry-run] [branch]"
+    local DRY_RUN="" FILTER_BRANCH="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) DRY_RUN=1 ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            -*) die "$USAGE_LINE" ;;
+            *) [ -z "$FILTER_BRANCH" ] || die "$USAGE_LINE"; FILTER_BRANCH="$arg" ;;
+        esac
+    done
+    [ -z "$DRY_RUN" ] || echo "(dry run — nothing is created, validated, pushed or opened)"
 
     # Validates in the worktree that has <br> checked out (creating the
     # dispatch one if none does), so the repo's own checkout is never moved —
     # it can't be anyway: git refuses a branch another worktree holds.
+    # Never deletes anything: that worktree may be the user's own checkout.
     ship_one() {
-        local dir="$1" br="$2" default_branch="$3" repo="$4"
+        local dir="$1" br="$2" default_branch="$3" repo="$4" slug="$5" open_pr="$6"
         local wt; wt="$(worktree_of_branch "$dir" "$br")"
         if [ -z "$wt" ]; then
             wt="$WORKTREES_DIR/$(repo_label_of "$repo")/${br//\//-}"
-            mkdir -p "$(dirname "$wt")"
-            ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+            if [ -n "$DRY_RUN" ]; then
+                echo "-- would create worktree $wt"
+            else
+                mkdir -p "$(dirname "$wt")"
+                ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+            fi
         fi
-        local holder; holder="$(lock_holder "$wt")"
-        if [ -n "$holder" ]; then
-            echo "!! a worker (pid ${holder%% *}, since ${holder#* }) is still running in $wt — not shipping a moving branch"
-            return 1
-        fi
-        if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no)" ]; then
-            echo "!! $wt has uncommitted changes — commit them (or dispatch a fix-up) first:"
-            git -C "$wt" status --short --untracked-files=no
-            return 1
+        [ "$wt" != "$dir" ] || echo "-- $br is checked out in $repo's own checkout (checkout mode) — validating there"
+
+        if [ -d "$wt" ]; then
+            local holder; holder="$(lock_holder "$wt")"
+            if [ -n "$holder" ]; then
+                echo "!! a worker (pid ${holder%% *}, since ${holder#* }) is still running in $wt — not shipping a moving branch"
+                return 1
+            fi
+            # Untracked files count: tests would pass on files the push omits.
+            local dirty; dirty="$(git -C "$wt" status --porcelain --untracked-files=all)"
+            if [ -n "$dirty" ]; then
+                echo "!! $wt has uncommitted or untracked files — tests would see them, the push wouldn't."
+                echo "   Commit them (dispatch a fix-up), gitignore them, or remove them, then re-ship:"
+                echo "$dirty" | sed 's/^/     /'
+                return 1
+            fi
         fi
 
         local cmd
@@ -665,18 +722,35 @@ cmd_ship() {
             echo "!! no validation command for $repo — define test_cmd_for in $CONFIG_FILE"
             return 1
         fi
+
+        local body
+        body="$(git -C "$dir" log --format='- %s' "origin/$default_branch..$br")"
+        if [ -n "$DRY_RUN" ]; then
+            echo "-- would validate in $wt: $cmd"
+            echo "-- would run the quality gate: grade.sh $wt $br $(thresholds_file)"
+            echo "-- would push $br to origin:"
+            echo "$body" | sed 's/^/     /'
+            if [ -n "$open_pr" ]; then
+                echo "-- would update open PR $open_pr"
+            else
+                echo "-- would open a PR $br -> $default_branch on $slug"
+            fi
+            return 0
+        fi
+
         echo "-- validating in $wt: $cmd"
-        local untracked_before vrc=0
-        untracked_before="$(git -C "$wt" ls-files --others --exclude-standard --directory)"
+        local vrc=0
         (cd "$wt" && eval "$cmd") || vrc=$?
-        # Drop what validation itself left behind (build output, lockfiles) so
-        # a re-dispatched worker's `git add .` can't commit it.
-        comm -13 <(echo "$untracked_before" | sort) \
-            <(git -C "$wt" ls-files --others --exclude-standard --directory | sort) \
-            | while IFS= read -r f; do [ -n "$f" ] && rm -rf "${wt:?}/$f"; done
         if [ "$vrc" -ne 0 ]; then
             echo "!! validation failed for $repo:$br — not pushing"
             return 1
+        fi
+        # Report, never delete, what validation left behind: it isn't in the
+        # push, and the next ship refuses the tree until it's gitignored.
+        local leftovers; leftovers="$(git -C "$wt" status --porcelain --untracked-files=all)"
+        if [ -n "$leftovers" ]; then
+            echo "!! validation left files behind in $wt (not deleted; gitignore or remove them — they block the next ship):"
+            echo "$leftovers" | sed 's/^/     /'
         fi
 
         echo "-- quality gate"
@@ -688,21 +762,20 @@ cmd_ship() {
         echo "-- validation + quality passed, pushing and opening PR"
         git -C "$dir" push -u origin "$br" || return 1
 
-        local slug body
-        slug="$(repo_slug_of "$dir")"
-        body="$(git -C "$dir" log --format='- %s' "origin/$default_branch..$br")"
-
-        local issue_num
-        issue_num="$(issue_number_for_branch "$slug" "$br")"
-        if [ -n "$issue_num" ]; then
+        local issue_num=""
+        if issue_num="$(issue_number_for_branch "$slug" "$br")" && [ -n "$issue_num" ]; then
             body="$body
 
 Closes #$issue_num"
             gh issue edit "$issue_num" -R "$slug" \
-                --remove-label "status:dispatched" --add-label "status:validating" \
-                >/dev/null 2>&1 || true
+                --remove-label "status:dispatched" --add-label "status:validating" >/dev/null \
+                || echo "!! could not relabel $slug#$issue_num (continuing)" >&2
         fi
 
+        if [ -n "$open_pr" ]; then
+            echo "-- pushed; PR already open: $open_pr"
+            return 0
+        fi
         local pr_out
         if ! pr_out="$(gh -R "$slug" pr create --head "$br" --base "$default_branch" \
             --title "$br" --body "$body" 2>&1)"; then
@@ -718,49 +791,75 @@ Closes #$issue_num"
         echo "$pr_out"
     }
 
-    local failed=()
+    local failed=() matched=""
     for repo in "${REPOS[@]}"; do
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
 
+        local branches=() outside=()
+        if [ -n "$FILTER_BRANCH" ]; then
+            git -C "$dir" show-ref --verify --quiet "refs/heads/$FILTER_BRANCH" || continue
+            branches=("$FILTER_BRANCH")
+        else
+            mapfile -t branches < <(agent_branches "$dir")
+            mapfile -t outside < <(dispatch_worktree_branches "$dir" | grep -vxF -f <(agent_branches "$dir"; echo) || true)
+        fi
+        [ "${#outside[@]}" -eq 0 ] \
+            || echo "note: $repo has dispatch worktrees outside AGENT_BRANCH_PREFIX ($AGENT_BRANCH_PREFIX), not shipped: ${outside[*]} — name one explicitly to ship it"
+        [ "${#branches[@]}" -gt 0 ] || continue
+        matched=1
+
+        # Stale origin/<default> skews ahead counts, the PR body and the gate's
+        # diff base: fetch once per repo before looking at anything.
+        if ! git -C "$dir" fetch -q origin; then
+            echo "!! git fetch failed for $repo — skipping it (counts against a stale origin are wrong)"
+            failed+=("$repo")
+            continue
+        fi
         local default_branch slug
-        default_branch="$(default_branch_of "$dir")"
+        default_branch="$(default_branch_of "$dir")" || { failed+=("$repo"); continue; }
         slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
 
-        local branches=()
-        while IFS= read -r line; do branches+=("$line"); done \
-            < <(git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX")
-
-        for br in ${branches+"${branches[@]}"}; do
-            [ -z "$br" ] && continue
-            if [ -n "$FILTER_BRANCH" ] && [ "$br" != "$FILTER_BRANCH" ]; then
+        local br
+        for br in "${branches[@]}"; do
+            [ -n "$br" ] || continue
+            local behind ahead
+            read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
+            if [ "$ahead" -eq 0 ]; then
+                [ -z "$FILTER_BRANCH" ] || echo "skip $repo:$br — nothing ahead of $default_branch"
                 continue
             fi
 
-            local ahead
-            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
-            [ "$ahead" -eq 0 ] && continue
-
             # Squash-merged or rejected branches stay "ahead" forever; a PR
             # already closed/merged at this exact tip means it was decided.
-            local tip decided
+            # A gh failure must not read as "no PR": abort this branch.
+            local tip prs decided open_pr
             tip="$(git -C "$dir" rev-parse "$br")"
-            decided="$(gh -R "$slug" pr list --head "$br" --state all --json number,state,headRefOid \
-                --jq ".[] | select(.headRefOid == \"$tip\" and .state != \"OPEN\") | \"#\(.number) \(.state)\"" \
-                2>/dev/null | head -n1 || true)"
+            if ! prs="$(prs_for_branch "$slug" "$br")"; then
+                echo "!! can't tell whether $repo:$br already has a PR — not shipping it"
+                failed+=("$repo:$br")
+                continue
+            fi
+            decided="$(jq -r --arg tip "$tip" \
+                '[.[] | select(.headRefOid == $tip and .state != "OPEN")][0] // empty | "#\(.number) \(.state)"' <<<"$prs")"
             if [ -n "$decided" ]; then
                 echo "skip $repo:$br — PR $decided at this tip (delete the branch, or add commits to reship)"
                 continue
             fi
+            open_pr="$(jq -r '[.[] | select(.state == "OPEN")][0].url // empty' <<<"$prs")"
 
-            echo "== $repo : $br ($ahead commit(s) ahead of $default_branch) =="
-            if ! ship_one "$dir" "$br" "$default_branch" "$repo"; then
+            echo "== $repo : $br ($ahead ahead, $behind behind $default_branch) =="
+            if ! ship_one "$dir" "$br" "$default_branch" "$repo" "$slug" "$open_pr"; then
                 echo "!! failed for $repo:$br (validate/quality/push/PR) — not proceeding further on this branch"
                 failed+=("$repo:$br")
             fi
         done
     done
 
+    if [ -n "$FILTER_BRANCH" ] && [ -z "$matched" ]; then
+        echo "!! no repo in REPOS has a local branch named $FILTER_BRANCH" >&2
+        return 1
+    fi
     if [ "${#failed[@]}" -gt 0 ]; then
         echo "!! not shipped: ${failed[*]}" >&2
         return 1
@@ -874,7 +973,8 @@ cmd_status() {
 
         echo "== $repo (on $cur, default $default_branch, $dirty dirty file(s)) =="
 
-        git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX" | while read -r br; do
+        # Agent branches plus anything a dispatch worktree holds, whatever its prefix.
+        { agent_branches "$dir"; dispatch_worktree_branches "$dir"; } | sort -u | while read -r br; do
             [ -z "$br" ] && continue
             local behind ahead
             read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
