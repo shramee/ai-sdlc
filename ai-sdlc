@@ -338,36 +338,70 @@ open_terminal() {
 
 # ------------------------------------------------------------- gh tracking -
 ensure_status_labels() {
-    local slug="$1"
-    gh label create "status:dispatched" -R "$slug" --color fbca04 --force >/dev/null 2>&1 || true
-    gh label create "status:validating" -R "$slug" --color 0e8a16 --force >/dev/null 2>&1 || true
+    local slug="$1" label color out
+    for label in status:dispatched:fbca04 status:validating:0e8a16; do
+        color="${label##*:}"; label="${label%:*}"
+        out="$(gh label create "$label" -R "$slug" --color "$color" --force 2>&1 >/dev/null)" \
+            || echo "!! couldn't ensure label $label on $slug: $out" >&2
+    done
+    return 0
+}
+
+# Hidden marker in a tracking issue's body; titles get edited, this doesn't.
+issue_marker() { echo "<!-- sdlc-branch: $1 -->"; }
+
+# Tracking issue for <branch>: the one whose body carries its marker, else an
+# exact title match (issues from before the marker); open beats closed.
+# Prints "<number> <STATE>", or nothing if none. Returns 1 when gh fails, so
+# callers can tell "no issue" from "couldn't look" — and don't create a dup.
+issue_for_branch() {
+    local slug="$1" branch="$2" out
+    [ -n "$slug" ] || { echo "!! no GitHub slug for origin — can't look up issues" >&2; return 1; }
+    if ! out="$(gh issue list -R "$slug" --state all -L 500 --json number,title,body,state 2>&1)"; then
+        echo "!! gh issue list failed for $slug: $out" >&2
+        return 1
+    fi
+    jq -r --arg b "$branch" --arg m "$(issue_marker "$branch")" '
+        [.[] | select((.body // "") | contains($m))] + [.[] | select(.title == $b)]
+        | map(select(.state == "OPEN")) + map(select(.state != "OPEN"))
+        | .[0] // empty | "\(.number) \(.state)"' <<<"$out"
 }
 
 issue_number_for_branch() {
-    local slug="$1" branch="$2"
-    gh issue list -R "$slug" --state open --json number,title \
-        --jq ".[] | select(.title == \"$branch\") | .number" 2>/dev/null | head -n1
+    local found; found="$(issue_for_branch "$@")" || return 1
+    echo "${found%% *}"
 }
 
 ensure_issue_for_run() {
-    local slug="$1" branch="$2" prompt="$3"
+    local slug="$1" branch="$2" prompt="$3" found
     ensure_status_labels "$slug"
 
-    local issue_num
-    issue_num="$(issue_number_for_branch "$slug" "$branch")"
+    if ! found="$(issue_for_branch "$slug" "$branch")"; then
+        echo "!! not creating a tracking issue: can't tell whether $branch already has one" >&2
+        return 0
+    fi
 
-    if [ -n "$issue_num" ]; then
-        gh issue comment "$issue_num" -R "$slug" --body "Re-dispatched:
+    local issue_num out
+    if [ -n "$found" ]; then
+        issue_num="${found%% *}"
+        if [ "${found#* }" != OPEN ]; then
+            out="$(gh issue reopen "$issue_num" -R "$slug" 2>&1 >/dev/null)" \
+                || echo "!! couldn't reopen $slug#$issue_num: $out" >&2
+        fi
+        out="$(gh issue comment "$issue_num" -R "$slug" --body "Re-dispatched:
 
-$prompt" >/dev/null 2>&1 || true
-        gh issue edit "$issue_num" -R "$slug" \
-            --remove-label "status:validating" --add-label "status:dispatched" \
-            >/dev/null 2>&1 || true
+$prompt" 2>&1 >/dev/null)" || echo "!! couldn't comment on $slug#$issue_num: $out" >&2
+        out="$(gh issue edit "$issue_num" -R "$slug" \
+            --remove-label "status:validating" --add-label "status:dispatched" 2>&1 >/dev/null)" \
+            || echo "!! couldn't relabel $slug#$issue_num: $out" >&2
     else
-        local url
-        url="$(gh issue create -R "$slug" --title "$branch" --body "$prompt" \
-            --label "status:dispatched" 2>/dev/null)" || true
-        issue_num="$(echo "$url" | sed -E 's#.*/issues/([0-9]+)$#\1#')"
+        if ! out="$(gh issue create -R "$slug" --title "$branch" --label "status:dispatched" --body "$prompt
+
+$(issue_marker "$branch")" 2>&1)"; then
+            echo "!! couldn't create a tracking issue on $slug: $out" >&2
+            return 0
+        fi
+        issue_num="$(echo "$out" | sed -nE 's#.*/issues/([0-9]+)$#\1#p' | tail -n1)"
     fi
 
     echo "$issue_num"
@@ -746,7 +780,7 @@ cmd_review_context() {
     git -C "$dir" diff "origin/$default_branch...$BRANCH" 2>/dev/null || echo "(diff unavailable)"
     echo '```'
     echo
-    local issue_num; issue_num="$(issue_number_for_branch "$slug" "$BRANCH" 2>/dev/null || true)"
+    local issue_num; issue_num="$(issue_number_for_branch "$slug" "$BRANCH" || true)"
     if [ -n "$issue_num" ]; then
         echo "### tracking issue #$issue_num"
         gh issue view "$issue_num" -R "$slug" --json title,body,comments \
