@@ -29,9 +29,11 @@
 #       with uncommitted/untracked files or a live worker. Failing branches
 #       are left unpushed for a fix-up dispatch (exit 1); tips whose PR was
 #       already closed/merged are skipped. --dry-run prints the plan only.
-#   sync [repo ...]
-#       Pull merged default branches; in submodule projects, stage+commit the
-#       moved pointer in the parent (never pushes it).
+#   sync [--delete-merged] [repo ...]
+#       Fast-forward each default branch to origin's without moving what's
+#       checked out; in submodule projects, commit just the moved pointers in
+#       the parent (never pushes). Reports agent branches whose PR merged (per
+#       GitHub); --delete-merged removes those branches and their worktrees.
 #   status
 #       Read-only fleet view: branches, ahead/behind counts, running workers, PRs.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
@@ -1010,51 +1012,152 @@ Closes #$issue_num"
 
 # ----------------------------------------------------------------- sync ----
 cmd_sync() {
-    local repos=("$@")
-    [ "${#repos[@]}" -eq 0 ] && repos=("${REPOS[@]}")
+    local USAGE_LINE="usage: ai-sdlc sync [--delete-merged] [repo ...]"
+    local repos=() DELETE_MERGED="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --delete-merged) DELETE_MERGED=1 ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            -*) die "$USAGE_LINE" ;;
+            *) repos+=("$arg") ;;
+        esac
+    done
+    [ "${#repos[@]}" -gt 0 ] || repos=("${REPOS[@]}")
 
-    sync_one() {
-        local dir="$1" default_branch="$2"
-        git -C "$dir" checkout "$default_branch"
-        git -C "$dir" pull --ff-only origin "$default_branch"
-    }
-
-    local updated=()
-
+    local updated=() shas=() failed=()
     for repo in "${repos[@]}"; do
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
 
-        local default_branch orig_branch before after
-        default_branch="$(default_branch_of "$dir")"
-        orig_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
-        before="$(git -C "$dir" rev-parse HEAD)"
-
-        if ! sync_one "$dir" "$default_branch"; then
-            echo "!! sync failed for $repo — skipping"
-            git -C "$dir" checkout "$orig_branch" || echo "!! could not restore $repo to $orig_branch"
-            continue
+        if ! git -C "$dir" fetch -q origin; then
+            echo "!! git fetch failed for $repo — skipping"
+            failed+=("$repo"); continue
+        fi
+        local default_branch
+        default_branch="$(default_branch_of "$dir")" || { failed+=("$repo"); continue; }
+        if ! advance_default_branch "$dir" "$default_branch" "$repo"; then
+            failed+=("$repo"); continue
         fi
 
-        after="$(git -C "$dir" rev-parse HEAD)"
-        if [ "$before" != "$after" ]; then
-            echo "$repo: $before -> $after"
-            if project_is_superrepo && [ "$repo" != "." ]; then
-                git -C "$PROJECT_ROOT" add "$repo"
-                updated+=("$repo")
+        if project_is_superrepo && [ "$repo" != "." ]; then
+            local recorded new
+            recorded="$(git -C "$PROJECT_ROOT" rev-parse --verify --quiet "HEAD:$repo" || true)"
+            new="$(git -C "$dir" rev-parse "refs/heads/$default_branch")"
+            if [ "$recorded" != "$new" ]; then
+                echo "$repo: pointer ${recorded:0:12} -> ${new:0:12}"
+                updated+=("$repo"); shas+=("$new")
             fi
         fi
+
+        report_merged_branches "$dir" "$repo" "$default_branch"
     done
 
     if [ "${#updated[@]}" -eq 0 ]; then
         echo "No parent-repo pointers to update."
-        return 0
+    else
+        commit_pointers "chore: sync ${updated[*]} to latest upstream" updated shas
+        echo "Committed parent repo update for: ${updated[*]}"
+        echo "Review with 'git show', then push manually when ready."
     fi
+    if [ "${#failed[@]}" -gt 0 ]; then
+        echo "!! not synced: ${failed[*]}" >&2
+        return 1
+    fi
+}
 
-    # Pathspec: commit only the moved pointers, not whatever else is staged.
-    git -C "$PROJECT_ROOT" commit -m "chore: sync ${updated[*]} to latest upstream" -- "${updated[@]}"
-    echo "Committed parent repo update for: ${updated[*]}"
-    echo "Review with 'git show', then push manually when ready."
+# Fast-forward <default> to origin's without moving whatever <dir> has checked
+# out: a checkout-mode branch or a detached submodule stays exactly where it is.
+advance_default_branch() {
+    local dir="$1" default_branch="$2" repo="$3" wt cur
+    wt="$(worktree_of_branch "$dir" "$default_branch")"
+    if [ -n "$wt" ]; then
+        # Checked out somewhere: update it there, so index and tree follow.
+        git -C "$wt" merge --ff-only -q "origin/$default_branch" && return 0
+        echo "!! $repo: $default_branch in $wt can't fast-forward (diverged, or local changes in the way) — skipping"
+        return 1
+    fi
+    local before; before="$(git -C "$dir" rev-parse --verify --quiet "refs/heads/$default_branch" || true)"
+    [ "$before" != "$(git -C "$dir" rev-parse "origin/$default_branch")" ] || return 0
+    if [ -n "$before" ]; then
+        if ! git -C "$dir" merge-base --is-ancestor "$default_branch" "origin/$default_branch"; then
+            echo "!! $repo: local $default_branch has diverged from origin — skipping"
+            return 1
+        fi
+        git -C "$dir" update-ref "refs/heads/$default_branch" "origin/$default_branch"
+    else
+        git -C "$dir" branch -q --track "$default_branch" "origin/$default_branch"
+    fi
+    cur="$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "detached HEAD")"
+    echo "$repo: advanced $default_branch to origin's; left the checkout on $cur"
+}
+
+# Commit exactly these submodule pointers (names/shas: array variable names)
+# with plumbing: `git commit -- <path>` would re-read each submodule's HEAD,
+# which isn't the default branch when the submodule is on something else.
+commit_pointers() {
+    local msg="$1"; local -n _paths="$2" _shas="$3"
+    local tmp_index tree commit old i
+    tmp_index="$(mktemp -t ai-sdlc-index.XXXXXX)"; rm -f "$tmp_index"
+    old="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+    GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" read-tree "$old"
+    for i in "${!_paths[@]}"; do
+        GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" update-index --cacheinfo "160000,${_shas[$i]},${_paths[$i]}"
+    done
+    tree="$(GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" write-tree)"
+    rm -f "$tmp_index"
+    commit="$(git -C "$PROJECT_ROOT" commit-tree "$tree" -p "$old" -m "$msg")"
+    git -C "$PROJECT_ROOT" update-ref -m "ai-sdlc sync" HEAD "$commit" "$old"
+    # Keep the real index in step for these paths; anything else staged stays staged.
+    for i in "${!_paths[@]}"; do
+        git -C "$PROJECT_ROOT" update-index --cacheinfo "160000,${_shas[$i]},${_paths[$i]}"
+    done
+}
+
+# Which agent branches' PRs merged — checked on GitHub, not guessed from
+# ancestry (squash/rebase merges never look merged locally). With
+# --delete-merged, drops each such branch and its dispatch worktree.
+report_merged_branches() {
+    local dir="$1" repo="$2" default_branch="$3" slug br
+    slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
+    while IFS= read -r br; do
+        [ -n "$br" ] && [ "$br" != "$default_branch" ] || continue
+        local prs merged num oid tip
+        prs="$(prs_for_branch "$slug" "$br")" || { echo "!! $repo:$br: PR state unknown — leaving it alone"; continue; }
+        merged="$(jq -r '[.[] | select(.state == "MERGED")][0] // empty | "\(.number) \(.headRefOid)"' <<<"$prs")"
+        [ -n "$merged" ] || continue
+        num="${merged%% *}"; oid="${merged#* }"
+        tip="$(git -C "$dir" rev-parse "$br")"
+        if [ "$tip" != "$oid" ] && ! git -C "$dir" merge-base --is-ancestor "$tip" "origin/$default_branch"; then
+            echo "$repo:$br: PR #$num merged, but the branch has commits since — keeping it"
+            continue
+        fi
+        if [ -z "$DELETE_MERGED" ]; then
+            echo "$repo:$br: merged (PR #$num) — 'ai-sdlc sync --delete-merged' removes it and its worktree"
+        else
+            delete_branch_and_worktree "$dir" "$repo" "$br" && echo "$repo:$br: merged (PR #$num) — deleted branch and worktree"
+        fi
+    done < <({ agent_branches "$dir"; dispatch_worktree_branches "$dir"; } | sort -u)
+}
+
+# Never touches the repo's own checkout, a locked worktree, or a dirty one.
+delete_branch_and_worktree() {
+    local dir="$1" repo="$2" br="$3" wt holder
+    wt="$(worktree_of_branch "$dir" "$br")"
+    if [ "$wt" = "$dir" ]; then
+        echo "!! $repo:$br is checked out in $repo's own checkout — restore it first; not deleting"
+        return 1
+    fi
+    if [ -n "$wt" ]; then
+        holder="$(lock_holder "$wt")"
+        [ -z "$holder" ] || { echo "!! $repo:$br: a worker (pid ${holder%% *}) is running in $wt — not deleting"; return 1; }
+        if [ -n "$(git -C "$wt" status --porcelain --untracked-files=all)" ]; then
+            echo "!! $repo:$br: $wt has uncommitted/untracked files — not deleting"
+            return 1
+        fi
+        git -C "$dir" worktree remove "$wt" || return 1
+    fi
+    git -C "$dir" branch -q -D "$br" || return 1
+    rm -f "$(session_file_for "$(repo_label_of "$repo")" "$br")"
 }
 
 # ------------------------------------------------------------- checkout ----
