@@ -41,6 +41,9 @@ REPOS=(.)
 # AGENT_GIT_NAME="myproject-bot"
 # AGENT_GIT_EMAIL="bot@users.noreply.github.com"
 
+# `ai-sdlc prune` removes logs older than this many days. Default: 14
+# PRUNE_LOG_DAYS=14
+
 # Where logs and host-side worktrees live. Default: <project>/.sdlc/{logs,worktrees}
 # STATE_DIR=".sdlc"
 

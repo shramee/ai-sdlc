@@ -36,6 +36,13 @@
 #       GitHub); --delete-merged removes those branches and their worktrees.
 #   status
 #       Read-only fleet view: branches, ahead/behind counts, running workers, PRs.
+#   doctor
+#       Read-only health check: tools, gh auth, model, origin/HEAD, CI vs
+#       test_cmd_for drift, stale locks, orphan worktrees, old logs.
+#   prune [--yes] [--days N]
+#       Remove dispatch worktrees whose PR merged (and the branch) or closed
+#       (worktree only), and logs older than N days (PRUNE_LOG_DAYS, 14).
+#       Dry run unless --yes.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
 #       Work a branch directly on the host; no branch = interactive picker.
 #   restore <repo> [--stash|--reset|--wip]
@@ -503,10 +510,7 @@ agent_branches() {
 # Branches checked out in dispatch worktrees (under WORKTREES_DIR), whatever
 # their prefix.
 dispatch_worktree_branches() {
-    local root; root="$(cd -P "$WORKTREES_DIR" 2>/dev/null && pwd)" || return 0
-    git -C "$1" worktree list --porcelain | awk -v root="$root/" '
-        /^worktree / { wt = substr($0, 10) }
-        /^branch refs\/heads\// { if (index(wt, root) == 1) print substr($0, 19) }'
+    dispatch_worktrees "$1" | cut -f2 | grep -v '^$' || true
 }
 
 # JSON array of every PR (any state) whose head is <branch>. Fails loudly: a
@@ -1241,6 +1245,263 @@ cmd_status() {
     done
 }
 
+# --------------------------------------------------------------- doctor ----
+# Every registered worktree of <dir> under WORKTREES_DIR, as "<path>\t<branch>"
+# (branch empty when detached).
+dispatch_worktrees() {
+    local root; root="$(cd -P "$WORKTREES_DIR" 2>/dev/null && pwd)" || return 0
+    git -C "$1" worktree list --porcelain | awk -v root="$root/" '
+        function flush() { if (wt != "" && index(wt, root) == 1) print wt "\t" br; wt = ""; br = "" }
+        /^worktree / { flush(); wt = substr($0, 10) }
+        /^branch refs\/heads\// { br = substr($0, 19) }
+        END { flush() }'
+}
+
+# One command per line from a test_cmd_for string or workflow `run:` lines:
+# split on && ; ||, drop setup noise (cd, echo, git, ...), and spell
+# `pnpm run x` as `pnpm x` so equivalent invocations compare equal.
+normalize_cmds() {
+    awk '{
+        n = split($0, parts, /&&|;|\|\|/)
+        for (i = 1; i <= n; i++) {
+            s = parts[i]
+            gsub(/^[ \t"'\'']+|[ \t"'\'']+$/, "", s); gsub(/[ \t]+/, " ", s)
+            if (s == "" || s ~ /^#/) continue
+            split(s, w, " ")
+            if (w[1] ~ /^(cd|echo|export|mkdir|ls|cat|set|curl|wget|sudo|apt|apt-get|brew|git|cp|mv|rm|chmod|source|printf|tee|true|\.)$/) continue
+            if ((w[1] == "pnpm" || w[1] == "yarn") && w[2] == "run") sub(/ run /, " ", s)
+            if (w[1] == "npm" && w[2] == "run" && w[3] == "test") s = "npm test"
+            print s
+        }
+    }'
+}
+
+# The `run:` commands of a GitHub Actions workflow, block scalars included.
+workflow_run_cmds() {
+    awk '
+        function emit(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); if (s != "") print s }
+        inblock {
+            match($0, /^ */)
+            if ($0 ~ /^[ \t]*$/ || RLENGTH > bindent) { emit($0); next }
+            inblock = 0
+        }
+        /^[ \t]*(- )?run:[ \t]*/ {
+            line = $0; sub(/^[ \t]*(- )?run:[ \t]*/, "", line)
+            if (line ~ /^[|>][-+]?[ \t]*$/) { match($0, /^ */); bindent = RLENGTH; inblock = 1 }
+            else emit(line)
+        }' "$1"
+}
+
+# Warn when CI runs a command ship's test_cmd_for doesn't — ship would go green
+# over a red PR. A heuristic over normalised strings; warnings only.
+ci_drift() {
+    local dir="$1" cmd="$2" wf line key closest local_cmds
+    local_cmds="$(normalize_cmds <<<"$cmd")"
+    for wf in "$dir"/.github/workflows/*.yml "$dir"/.github/workflows/*.yaml; do
+        [ -f "$wf" ] || continue
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" <<<"$local_cmds" && continue
+            key="$(awk '{ print ($2 == "run" || $2 == "exec" || $2 == "x") ? $1 " " $2 " " $3 : $1 " " $2 }' <<<"$line")"
+            closest="$(grep -F -- "$key" <<<"$local_cmds" | head -n1 || true)"
+            if [ -n "$closest" ]; then
+                doctor_warn "CI drift ($(basename "$wf")): CI runs \`$line\`, ship runs \`$closest\`"
+            else
+                doctor_warn "CI drift ($(basename "$wf")): CI runs \`$line\`, ship's test_cmd_for doesn't"
+            fi
+        done < <(workflow_run_cmds "$wf" | normalize_cmds | awk '!seen[$0]++')
+    done
+}
+
+doctor_ok()   { echo "  ok    $*"; }
+doctor_warn() { echo "  warn  $*"; DOCTOR_WARNS=$((DOCTOR_WARNS + 1)); }
+doctor_fail() { echo "  FAIL  $*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
+
+cmd_doctor() {
+    DOCTOR_WARNS=0 DOCTOR_FAILS=0
+    local t
+
+    echo "== tools"
+    for t in git jq python3; do
+        command -v "$t" >/dev/null 2>&1 && doctor_ok "$t" || doctor_fail "$t not on PATH"
+    done
+    for t in lizard jscpd; do
+        command -v "$t" >/dev/null 2>&1 && doctor_ok "$t" || doctor_fail "$t not on PATH — ship's quality gate needs it"
+    done
+    if command -v "${OPENCODE_CMD[0]}" >/dev/null 2>&1; then
+        doctor_ok "${OPENCODE_CMD[0]} ($(command -v "${OPENCODE_CMD[0]}"))"
+    else
+        doctor_fail "${OPENCODE_CMD[0]} not on PATH — dispatch can't run workers"
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        doctor_fail "gh not on PATH — ship/sync/issue tracking need it"
+    elif gh auth status >/dev/null 2>&1; then
+        doctor_ok "gh (authenticated)"
+    else
+        doctor_fail "gh is not authenticated — run: gh auth login"
+    fi
+
+    echo "== config ($CONFIG_FILE)"
+    local a model=""
+    [ -n "$OPENCODE_MODEL" ] && model="$OPENCODE_MODEL"
+    for a in "${OPENCODE_CMD[@]}"; do case "$a" in -m|--model|--model=*) model="(in OPENCODE_CMD)" ;; esac; done
+    if [ -n "$model" ]; then doctor_ok "model: $model"
+    else doctor_warn "no model pinned — opencode's default applies (set OPENCODE_MODEL, or pass -m per dispatch)"; fi
+    [ -f "$SUBAGENT_INSTRUCTIONS" ] && doctor_ok "instructions: $SUBAGENT_INSTRUCTIONS" \
+        || doctor_warn "SUBAGENT_INSTRUCTIONS missing: $SUBAGENT_INSTRUCTIONS"
+    if [ -n "$DISPATCH_TIMEOUT" ] && ! [[ "$DISPATCH_TIMEOUT" =~ ^[0-9]+$ ]]; then
+        doctor_fail "DISPATCH_TIMEOUT must be whole seconds, got: $DISPATCH_TIMEOUT"
+    fi
+
+    local repo labels=()
+    for repo in "${REPOS[@]}"; do
+        labels+=("$(repo_label_of "$repo")")
+        local dir; dir="$(repo_dir_of "$repo")"
+        echo "== $repo"
+        [ -e "$dir/.git" ] || { doctor_fail "not initialized: $dir"; continue; }
+
+        git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null \
+            || doctor_warn "origin/HEAD unset — every default-branch lookup hits the network; run: git -C $dir remote set-head origin --auto"
+        local default_branch; default_branch="$(default_branch_of "$dir" 2>/dev/null)" \
+            || { doctor_fail "can't determine the default branch"; continue; }
+
+        local cmd; cmd="$(validation_cmd_for "$repo" "$dir")"
+        if [ -z "$cmd" ]; then doctor_fail "no validation command — define test_cmd_for"
+        else ci_drift "$dir" "$cmd"; fi
+
+        local cur; cur="$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "")"
+        if [ -n "$cur" ] && [ "$cur" != "$default_branch" ]; then
+            doctor_warn "own checkout is on $cur, not $default_branch (checkout mode? 'ai-sdlc restore $repo')"
+            [ ! -e "$WORKTREES_DIR/$(repo_label_of "$repo")/${cur//\//-}" ] \
+                || doctor_warn "$cur also has a dispatch worktree dir, but the branch is held by the own checkout — dispatch on it will fail"
+        fi
+
+        local wt br holder lock
+        while IFS=$'\t' read -r wt br; do
+            [ -n "$wt" ] || continue
+            if [ -z "$br" ]; then doctor_warn "worktree $wt is on a detached HEAD"; continue; fi
+            lock="$(lock_dir_of "$wt" 2>/dev/null || true)"
+            if [ -n "$lock" ] && [ -d "$lock" ]; then
+                holder="$(lock_holder "$wt")"
+                if [ -n "$holder" ]; then doctor_ok "$br: worker running (pid ${holder%% *})"
+                else doctor_warn "$br: stale lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?') is gone) — cleared on next dispatch, or rm -r $lock"; fi
+            fi
+            agent_branches "$dir" | grep -qxF -- "$br" \
+                || doctor_warn "$br has a dispatch worktree but no AGENT_BRANCH_PREFIX ($AGENT_BRANCH_PREFIX) matches — bare 'ship' skips it"
+        done < <(dispatch_worktrees "$dir")
+        git -C "$dir" worktree list --porcelain | grep -q '^prunable' \
+            && doctor_warn "git has prunable worktree entries — run: git -C $dir worktree prune"
+    done
+
+    echo "== state ($STATE_DIR)"
+    local d sub
+    if [ -d "$WORKTREES_DIR" ]; then
+        for d in "$WORKTREES_DIR"/*/; do
+            [ -d "$d" ] || continue
+            d="${d%/}"
+            if ! printf '%s\n' "${labels[@]}" | grep -qxF -- "$(basename "$d")"; then
+                doctor_warn "orphan: $d — no repo in REPOS has label $(basename "$d")"
+                continue
+            fi
+            for sub in "$d"/*/; do
+                [ -d "$sub" ] || continue
+                [ -e "$sub/.git" ] && git -C "$sub" rev-parse --git-dir >/dev/null 2>&1 \
+                    || doctor_warn "orphan: ${sub%/} is not a git worktree any more"
+            done
+        done
+        doctor_ok "worktrees: $(du -sh "$WORKTREES_DIR" 2>/dev/null | cut -f1)"
+    fi
+    if [ -d "$LOGS_DIR" ]; then
+        local old pids
+        old="$(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.log' -mtime +"$PRUNE_LOG_DAYS" | wc -l | tr -d ' ')"
+        pids="$(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.pid' | wc -l | tr -d ' ')"
+        doctor_ok "logs: $(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.log' | wc -l | tr -d ' ') ($(du -sh "$LOGS_DIR" 2>/dev/null | cut -f1))"
+        [ "$old" -eq 0 ] || doctor_warn "$old log(s) older than ${PRUNE_LOG_DAYS}d — 'ai-sdlc prune'"
+        [ "$pids" -eq 0 ] || doctor_warn "$pids leftover .pid file(s) from before worktree locks — 'ai-sdlc prune'"
+    fi
+
+    echo "doctor: $DOCTOR_FAILS failure(s), $DOCTOR_WARNS warning(s)"
+    [ "$DOCTOR_FAILS" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- prune ----
+cmd_prune() {
+    local USAGE_LINE="usage: ai-sdlc prune [--yes] [--days N]"
+    local APPLY="" days="$PRUNE_LOG_DAYS"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) APPLY=1 ;;
+            --days) days="${2:?$USAGE_LINE}"; shift ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            *) die "$USAGE_LINE" ;;
+        esac
+        shift
+    done
+    [[ "$days" =~ ^[0-9]+$ ]] || die "--days wants a whole number, got: $days"
+    [ -n "$APPLY" ] || echo "(dry run — pass --yes to apply)"
+
+    local repo in_use=()
+    for repo in "${REPOS[@]}"; do
+        local dir; dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || continue
+        local slug default_branch
+        slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
+        default_branch="$(default_branch_of "$dir")" || continue
+
+        local wt br
+        while IFS=$'\t' read -r wt br; do
+            [ -n "$wt" ] || continue
+            in_use+=("$(basename "$(readlink "$wt/agent.log" 2>/dev/null || echo none)" .log)")
+            [ -n "$br" ] || { echo "keep $wt — detached HEAD, decide by hand"; continue; }
+            local prs decided state num oid tip
+            prs="$(prs_for_branch "$slug" "$br")" || { echo "keep $repo:$br — PR state unknown"; continue; }
+            # Any open PR keeps it; otherwise the newest decided one rules.
+            [ -z "$(jq -r '.[] | select(.state == "OPEN") | .number' <<<"$prs")" ] || continue
+            decided="$(jq -r '[.[] | select(.state != "OPEN")][0] // empty | "\(.state) \(.number) \(.headRefOid)"' <<<"$prs")"
+            [ -n "$decided" ] || continue
+            read -r state num oid <<<"$decided"
+            tip="$(git -C "$dir" rev-parse "$br")"
+            if [ "$tip" != "$oid" ] && ! git -C "$dir" merge-base --is-ancestor "$tip" "origin/$default_branch"; then
+                echo "keep $repo:$br — PR #$num $state, but the branch has commits since"
+                continue
+            fi
+            local what="worktree $wt"
+            [ "$state" = MERGED ] && what="branch $br + $what" || what="$what (branch kept: PR was closed unmerged)"
+            if [ -z "$APPLY" ]; then
+                echo "would remove $repo: $what — PR #$num $state"
+            elif [ "$state" = MERGED ]; then
+                delete_branch_and_worktree "$dir" "$repo" "$br" && echo "removed $repo: $what"
+            else
+                prune_worktree "$dir" "$repo" "$br" "$wt" && echo "removed $repo: $what"
+            fi
+        done < <(dispatch_worktrees "$dir")
+        [ -z "$APPLY" ] || git -C "$dir" worktree prune
+    done
+
+    [ -d "$LOGS_DIR" ] || return 0
+    local f stem
+    while IFS= read -r f; do
+        stem="$(basename "$f")"; stem="${stem%.*}"
+        printf '%s\n' ${in_use+"${in_use[@]}"} | grep -qxF -- "$stem" && continue
+        if [ -n "$APPLY" ]; then rm -f "$f" && echo "removed $f"
+        else echo "would remove $f"; fi
+    done < <(find "$LOGS_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.session' -o -name '*.pid' \) \
+        \( -mtime +"$days" -o -name '*.pid' \) | sort)
+}
+
+# Remove one dispatch worktree, keeping its branch. Same refusals as
+# delete_branch_and_worktree.
+prune_worktree() {
+    local dir="$1" repo="$2" br="$3" wt="$4" holder
+    holder="$(lock_holder "$wt")"
+    [ -z "$holder" ] || { echo "!! $repo:$br: a worker (pid ${holder%% *}) is running — keeping"; return 1; }
+    if [ -n "$(git -C "$wt" status --porcelain --untracked-files=all)" ]; then
+        echo "!! $repo:$br: $wt has uncommitted/untracked files — keeping"
+        return 1
+    fi
+    git -C "$dir" worktree remove "$wt"
+}
+
 # --------------------------------------------------------------- config ----
 cmd_config() {
     cat <<EOF
@@ -1292,6 +1553,8 @@ case "$SUBCOMMAND" in
     ship)           cmd_ship "$@" ;;
     sync)           cmd_sync "$@" ;;
     status)         cmd_status "$@" ;;
+    doctor)         cmd_doctor "$@" ;;
+    prune)          cmd_prune "$@" ;;
     checkout)       cmd_checkout "$@" ;;
     restore)        cmd_restore "$@" ;;
     config)         cmd_config "$@" ;;
