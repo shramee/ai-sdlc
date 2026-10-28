@@ -29,7 +29,7 @@
 #       Pull merged default branches; in submodule projects, stage+commit the
 #       moved pointer in the parent (never pushes it).
 #   status
-#       Read-only fleet view: branches, ahead counts, running workers, PRs.
+#       Read-only fleet view: branches, ahead/behind counts, running workers, PRs.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
 #       Work a branch directly on the host; no branch = interactive picker.
 #   restore <repo> [--stash|--reset|--wip]
@@ -128,8 +128,32 @@ require_repo() {
     echo "$dir"
 }
 
+# Local first: origin/HEAD is set by clone (or `git remote set-head origin
+# --auto`). Only when it's unset do we ask the remote — slow, and needs network.
 default_branch_of() {
-    git -C "$1" remote show origin | sed -n '/HEAD branch/s/.*: //p'
+    local dir="$1" ref br
+    if ref="$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; then
+        echo "${ref#refs/remotes/origin/}"
+        return 0
+    fi
+    br="$(git -C "$dir" remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')"
+    if [ -n "$br" ] && [ "$br" != "(unknown)" ]; then
+        echo "$br"
+        return 0
+    fi
+    for br in main master; do
+        git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$br" && { echo "$br"; return 0; }
+    done
+    echo "!! can't determine the default branch of $dir — run: git -C $dir remote set-head origin --auto" >&2
+    return 1
+}
+
+# "<behind> <ahead>" of <branch> relative to origin/<default>.
+behind_ahead_of() {
+    local dir="$1" branch="$2" default_branch="$3" counts
+    counts="$(git -C "$dir" rev-list --left-right --count "origin/$default_branch...$branch" 2>/dev/null)" \
+        || counts="0 0"
+    echo "$counts" | awk '{print $1, $2}'
 }
 
 repo_slug_of() {
@@ -797,7 +821,7 @@ cmd_status() {
         [ -e "$dir/.git" ] || { echo "== $repo: not initialized =="; continue; }
 
         local default_branch cur dirty
-        default_branch="$(default_branch_of "$dir")"
+        default_branch="$(default_branch_of "$dir")" || { echo "== $repo: unknown default branch =="; continue; }
         cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
         dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
 
@@ -805,8 +829,8 @@ cmd_status() {
 
         git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX" | while read -r br; do
             [ -z "$br" ] && continue
-            local ahead
-            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
+            local behind ahead
+            read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
             local label; label="$(repo_label_of "$repo")"
             local wt="$WORKTREES_DIR/$label/${br//\//-}"
             local live="" pid
@@ -814,7 +838,7 @@ cmd_status() {
                 pid="$(cat "$(pidfile_for "$label" "$br")" 2>/dev/null || true)"
                 [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && live=" [worker running, pid $pid]"
             fi
-            echo "  branch $br: $ahead commit(s) ahead of $default_branch$live"
+            echo "  branch $br: $ahead ahead, $behind behind $default_branch$live"
         done
 
         local slug
