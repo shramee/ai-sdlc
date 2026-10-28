@@ -27,6 +27,15 @@ REPOS=(.)
 # use opencode's own default/configured model.
 # OPENCODE_MODEL="anthropic/claude-sonnet-5"
 
+# Wall-clock cap for one dispatch, in seconds; the worker is killed (TERM,
+# then KILL 30s later) and dispatch exits 124. Empty = no limit.
+# DISPATCH_TIMEOUT=7200
+
+# A re-dispatch on a branch continues that branch's last opencode session
+# (`--session <id>`, recorded in the logs dir). 0 = always start fresh.
+# Passing -s/--session/-c/--continue/--fork to dispatch overrides it.
+# DISPATCH_RESUME_SESSION=1
+
 # Commit identity for dispatched workers. Passed as GIT_AUTHOR_*/GIT_COMMITTER_*
 # env vars to the worker process only — never touches the host's git config.
 # AGENT_GIT_NAME="myproject-bot"

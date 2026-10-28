@@ -13,6 +13,9 @@
 #       Host worktree for <branch> + `opencode run --auto` in it, with
 #       subagent-instructions.md appended. Tracks a GitHub issue
 #       (status:dispatched), best-effort. Worker commits locally; never pushes.
+#       One worker per worktree (locked). Resumes continue the branch's last
+#       opencode session. Exits non-zero unless the run made commits and left
+#       a clean tree; DISPATCH_TIMEOUT caps wall-clock seconds.
 #   vibe <repo> <branch>
 #       Same worktree, interactive opencode session for a human.
 #   review-context <repo> <branch>
@@ -91,6 +94,10 @@ load_config() {
     # prompt (plus any extra flags passed on the command line); vibe drops it.
     OPENCODE_CMD=(opencode run --auto --format json)
     OPENCODE_MODEL=""
+    # Env wins over the default, the conf file over both.
+    DISPATCH_TIMEOUT="${DISPATCH_TIMEOUT:-}"
+    DISPATCH_RESUME_SESSION="${DISPATCH_RESUME_SESSION:-1}"
+    PRUNE_LOG_DAYS="${PRUNE_LOG_DAYS:-14}"
     AGENT_GIT_NAME=""
     AGENT_GIT_EMAIL=""
     STATE_DIR=""
@@ -509,8 +516,50 @@ worktree_of_branch() {
         $0 == "branch " ref { print (n == 1 ? main : wt); exit }'
 }
 
+# Where dispatch remembers a branch's last opencode session id.
+session_file_for() { echo "$LOGS_DIR/$1-${2//\//-}.session"; }
+
+# Runs "$@", killing it after <secs> (empty/0 = no limit) and returning 124,
+# like coreutils timeout — which macOS lacks, so this is a portable watchdog.
+# The command gets its own process group (set -m) so the kill reaches
+# opencode's children too; ^C is forwarded since it's no longer foreground.
+with_timeout() {
+    local secs="$1"; shift
+    if [ -z "$secs" ] || [ "$secs" = 0 ]; then "$@"; return; fi
+    local flag; flag="$(mktemp -t ai-sdlc-timeout.XXXXXX)"; rm -f "$flag"
+    set -m
+    "$@" &
+    local pid=$! wd rc=0
+    set +m
+    # shellcheck disable=SC2064  # expand now: pid is local
+    trap "kill -TERM -- -$pid 2>/dev/null" INT TERM HUP
+    ( sleep "$secs"; touch "$flag"; kill -TERM -- -"$pid"; sleep 30; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
+    wd=$!
+    while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
+    trap - INT TERM HUP
+    pkill -P "$wd" 2>/dev/null || true
+    kill "$wd" 2>/dev/null || true
+    wait "$wd" 2>/dev/null || true
+    if [ -e "$flag" ]; then rm -f "$flag"; return 124; fi
+    return "$rc"
+}
+
+# Resuming a branch whose PR was squash/rebase-merged at this very tip would
+# stack new work on commits main already has under other hashes, and the next
+# ship would re-PR them. A gh failure only warns: dispatch is best-effort here.
+refuse_if_merged() {
+    local dir="$1" br="$2" default_branch="$3" slug="$4" behind ahead prs merged
+    read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
+    [ "$ahead" -gt 0 ] && [ -n "$slug" ] || return 0
+    prs="$(prs_for_branch "$slug" "$br")" || { echo "!! couldn't check $br for a merged PR (continuing)" >&2; return 0; }
+    merged="$(jq -r --arg tip "$(git -C "$dir" rev-parse "$br")" \
+        '[.[] | select(.state == "MERGED" and .headRefOid == $tip)][0].number // empty' <<<"$prs")"
+    [ -z "$merged" ] \
+        || die "$br was already merged (PR #$merged) — dispatch onto a new branch, or clear it with 'ai-sdlc sync --delete-merged'"
+}
+
 # Host-side worktree, so plain git handles staleness/pruning normally.
-# Sets (non-local) WORKTREE, LOG_FILE.
+# Sets (non-local) WORKTREE, LOG_FILE, DEFAULT_BRANCH, RESUMED.
 prepare_worktree() {
     local REPO="$1" BRANCH="$2"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -524,8 +573,20 @@ prepare_worktree() {
     echo "Fetching $REPO" | tee -a "$LOG_FILE"
     git -C "$dir" fetch origin 2>&1 | tee -a "$LOG_FILE"
     local default_branch; default_branch="$(default_branch_of "$dir")"
+    DEFAULT_BRANCH="$default_branch"
+    RESUMED=""
+    git -C "$dir" show-ref --verify --quiet "refs/heads/$BRANCH" && RESUMED=1
 
     ensure_worktree "$dir" "$WORKTREE" "$BRANCH" "$default_branch" 2>&1 | tee -a "$LOG_FILE"
+
+    # A resumed branch is used as-is — never rebased — so say how stale it is.
+    if [ -n "$RESUMED" ]; then
+        local behind ahead
+        read -r behind ahead < <(behind_ahead_of "$dir" "$BRANCH" "$default_branch")
+        echo "Resuming $BRANCH as-is: $ahead ahead, $behind behind origin/$default_branch" | tee -a "$LOG_FILE"
+        [ "$behind" -eq 0 ] \
+            || echo "!! not rebased — if the work depends on newer $default_branch, tell the worker to rebase/merge it" | tee -a "$LOG_FILE"
+    fi
 
     ln -sf "$LOG_FILE" "$WORKTREE/agent.log"
     local gitdir; gitdir="$(git -C "$WORKTREE" rev-parse --git-common-dir)"
@@ -541,11 +602,15 @@ cmd_dispatch() {
     local PROMPT="${3:?$USAGE_LINE}"
     shift 3
 
-    local WORKTREE LOG_FILE
+    local WORKTREE LOG_FILE DEFAULT_BRANCH RESUMED
     prepare_worktree "$REPO" "$BRANCH"
     acquire_lock "$WORKTREE"
     # shellcheck disable=SC2064  # expand now: WORKTREE is local
     trap "release_lock '$WORKTREE'" EXIT
+
+    local slug
+    slug="$(repo_slug_of "$(repo_dir_of "$REPO")" 2>/dev/null)" || slug=""
+    [ -z "$RESUMED" ] || refuse_if_merged "$(repo_dir_of "$REPO")" "$BRANCH" "$DEFAULT_BRANCH" "$slug"
 
     {
         echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
@@ -555,8 +620,7 @@ cmd_dispatch() {
         echo "---"
     } >> "$LOG_FILE"
 
-    local slug issue_num
-    slug="$(repo_slug_of "$(repo_dir_of "$REPO")" 2>/dev/null)" || slug=""
+    local issue_num
     if [ -n "$slug" ]; then
         issue_num="$(ensure_issue_for_run "$slug" "$BRANCH" "$PROMPT")"
         if [ -n "$issue_num" ]; then
@@ -576,17 +640,39 @@ $instructions"
     # A per-dispatch -m/--model wins over the configured default.
     local model_flags=() arg
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
+    # Re-dispatch continues the branch's last opencode session (its context
+    # survives), unless the caller picked a session or DISPATCH_RESUME_SESSION=0.
+    local session_file session_flags=() own_session=""
+    session_file="$(session_file_for "$(repo_label_of "$REPO")" "$BRANCH")"
     for arg in "$@"; do
-        case "$arg" in -m|--model|--model=*) model_flags=() ;; esac
+        case "$arg" in
+            -m|--model|--model=*) model_flags=() ;;
+            -s|--session|--session=*|-c|--continue|--fork) own_session=1 ;;
+        esac
     done
+    if [ -z "$own_session" ] && [ "${DISPATCH_RESUME_SESSION:-1}" != 0 ] && [ -s "$session_file" ]; then
+        session_flags=(--session "$(cat "$session_file")")
+        echo "Continuing opencode session ${session_flags[1]} (DISPATCH_RESUME_SESSION=0 starts fresh)" | tee -a "$LOG_FILE"
+    fi
+    [ -z "${DISPATCH_TIMEOUT:-}" ] || echo "Wall-clock limit: ${DISPATCH_TIMEOUT}s" | tee -a "$LOG_FILE"
 
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
-    local rc=0 log_start
+    local rc=0 log_start start_tip
     log_start="$(wc -l < "$LOG_FILE")"
-    run_worker "$WORKTREE" "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} "$@" -- "$FULL_PROMPT" \
-        </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
+    start_tip="$(git -C "$WORKTREE" rev-parse HEAD)"
+    run_worker "$WORKTREE" with_timeout "${DISPATCH_TIMEOUT:-}" \
+        "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} ${session_flags+"${session_flags[@]}"} "$@" \
+        -- "$FULL_PROMPT" </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
 
     echo "" >> "$LOG_FILE"
+    local session
+    session="$(tail -n +"$((log_start + 1))" "$LOG_FILE" \
+        | grep -o '"sessionID":"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+    if [ -n "$session" ]; then
+        echo "$session" > "$session_file"
+        echo "opencode session: $session" | tee -a "$LOG_FILE"
+    fi
+    [ "$rc" -ne 124 ] || echo "!! worker hit DISPATCH_TIMEOUT (${DISPATCH_TIMEOUT}s) and was killed" | tee -a "$LOG_FILE" >&2
     # opencode reports provider/auth failures as JSON events buried in the
     # stream; surface the last one so a dead run isn't mistaken for a quiet one.
     local err
@@ -596,6 +682,28 @@ $instructions"
         echo "!! worker failed (rc=$rc): ${err:-see $LOG_FILE}" >&2
         [ "$rc" -ne 0 ] || rc=1
     fi
+
+    # Exit 0 isn't success: the work has to be committed on the branch.
+    local commits dirty head
+    commits="$(git -C "$WORKTREE" rev-list --count "$start_tip..$BRANCH")"
+    dirty="$(git -C "$WORKTREE" status --porcelain --untracked-files=all)"
+    head="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD || echo "(detached)")"
+    echo "-- run made $commits commit(s) on $BRANCH; tree $([ -n "$dirty" ] && echo dirty || echo clean)" \
+        | tee -a "$LOG_FILE"
+    if [ "$head" != "$BRANCH" ]; then
+        echo "!! the worker left $WORKTREE on $head, not $BRANCH" | tee -a "$LOG_FILE" >&2
+        rc=1
+    fi
+    if [ -n "$dirty" ]; then
+        echo "!! uncommitted changes left in $WORKTREE:" | tee -a "$LOG_FILE" >&2
+        echo "$dirty" | sed 's/^/     /' | tee -a "$LOG_FILE" >&2
+        rc=1
+    fi
+    if [ "$commits" -eq 0 ]; then
+        echo "!! the worker made no commits" | tee -a "$LOG_FILE" >&2
+        [ "$rc" -ne 0 ] || rc=1
+    fi
+    [ "$rc" -eq 0 ] || echo "!! dispatch did not finish cleanly — worktree kept for a resume dispatch: $WORKTREE" >&2
     return "$rc"
 }
 
