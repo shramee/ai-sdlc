@@ -308,7 +308,8 @@ ensure_clean_or_stash() {
 
     case "$mode" in
         stash)
-            local msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
+            local msg
+            msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
             git -C "$dir" stash push -u -m "$msg" >/dev/null
             echo "Stashed as: $msg (git -C $dir stash pop to recover)" >&2
             ;;
@@ -571,7 +572,8 @@ with_timeout() {
     "$@" &
     local pid=$! wd rc=0
     set +m
-    # shellcheck disable=SC2064  # expand now: pid is local
+    # Expand now, not when signalled: pid is local.
+    # shellcheck disable=SC2064
     trap "kill -TERM -- -$pid 2>/dev/null" INT TERM HUP
     ( sleep "$secs"; touch "$flag"; kill -TERM -- -"$pid"; sleep 30; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
     wd=$!
@@ -645,7 +647,8 @@ cmd_dispatch() {
     local WORKTREE LOG_FILE DEFAULT_BRANCH RESUMED
     prepare_worktree "$REPO" "$BRANCH"
     acquire_lock "$WORKTREE"
-    # shellcheck disable=SC2064  # expand now: WORKTREE is local
+    # Expand now, not when signalled: WORKTREE is local.
+    # shellcheck disable=SC2064
     trap "release_lock '$WORKTREE'" EXIT
 
     local slug
