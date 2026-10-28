@@ -401,9 +401,50 @@ thresholds_file() {
     fi
 }
 
-# pidfile for the running dispatch, so `status` can tell a live worker from a
-# dead one.
-pidfile_for() { echo "$LOGS_DIR/$1-${2//\//-}.pid"; }
+# ---------------------------------------------------------------- locks ----
+# One worker per worktree. The lock is a mkdir'd dir (atomic on every POSIX fs,
+# no flock on macOS) inside the worktree's own git dir, so it never shows up in
+# `git status`. It holds the owner's PID and start time; a lock whose PID is
+# dead is stale and gets cleared.
+lock_dir_of() {
+    local gd; gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+    echo "$gd/ai-sdlc.lock"
+}
+
+# Prints "<pid> <started>" if a live process holds <worktree>'s lock.
+lock_holder() {
+    local lock pid
+    lock="$(lock_dir_of "$1")" || return 0
+    [ -d "$lock" ] || return 0
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    # mkdir and the pid write aren't atomic together: give a fresh lock a beat.
+    [ -n "$pid" ] || { sleep 1; pid="$(cat "$lock/pid" 2>/dev/null || true)"; }
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid $(cat "$lock/started" 2>/dev/null || echo '?')"
+    fi
+}
+
+acquire_lock() {
+    local wt="$1" lock holder
+    lock="$(lock_dir_of "$wt")" || die "$wt is not a git worktree"
+    if ! mkdir "$lock" 2>/dev/null; then
+        holder="$(lock_holder "$wt")"
+        [ -z "$holder" ] \
+            || die "$wt is locked by a running worker (pid ${holder%% *}, since ${holder#* }) — wait for it or kill it"
+        echo "-- clearing stale lock $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?') is gone)" >&2
+        rm -rf "$lock"
+        mkdir "$lock" 2>/dev/null || die "could not take lock $lock"
+    fi
+    echo "$$" > "$lock/pid"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$lock/started"
+}
+
+release_lock() {
+    local lock; lock="$(lock_dir_of "$1")" || return 0
+    # Only our own lock: never yank one a later run took over.
+    [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$lock"
+    return 0
+}
 
 # ------------------------------------------------------------- dispatch ----
 # Create (or resume) the worktree at <worktree> for <branch>, branching off
@@ -467,6 +508,9 @@ cmd_dispatch() {
 
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
+    acquire_lock "$WORKTREE"
+    # shellcheck disable=SC2064  # expand now: WORKTREE is local
+    trap "release_lock '$WORKTREE'" EXIT
 
     {
         echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
@@ -501,10 +545,6 @@ $instructions"
         case "$arg" in -m|--model|--model=*) model_flags=() ;; esac
     done
 
-    local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
-    echo $$ > "$pidfile"
-    trap "rm -f '$pidfile'" EXIT
-
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
     local rc=0 log_start
     log_start="$(wc -l < "$LOG_FILE")"
@@ -532,6 +572,8 @@ cmd_vibe() {
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
     require_opencode
+    local holder; holder="$(lock_holder "$WORKTREE")"
+    [ -z "$holder" ] || die "a worker (pid ${holder%% *}) is running in $WORKTREE — wait for it first"
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
@@ -605,6 +647,11 @@ cmd_ship() {
             wt="$WORKTREES_DIR/$(repo_label_of "$repo")/${br//\//-}"
             mkdir -p "$(dirname "$wt")"
             ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+        fi
+        local holder; holder="$(lock_holder "$wt")"
+        if [ -n "$holder" ]; then
+            echo "!! a worker (pid ${holder%% *}, since ${holder#* }) is still running in $wt — not shipping a moving branch"
+            return 1
         fi
         if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no)" ]; then
             echo "!! $wt has uncommitted changes — commit them (or dispatch a fix-up) first:"
@@ -831,12 +878,11 @@ cmd_status() {
             [ -z "$br" ] && continue
             local behind ahead
             read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
-            local label; label="$(repo_label_of "$repo")"
-            local wt="$WORKTREES_DIR/$label/${br//\//-}"
-            local live="" pid
-            if [ -d "$wt" ]; then
-                pid="$(cat "$(pidfile_for "$label" "$br")" 2>/dev/null || true)"
-                [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && live=" [worker running, pid $pid]"
+            local wt live="" holder
+            wt="$(worktree_of_branch "$dir" "$br")"
+            if [ -n "$wt" ]; then
+                holder="$(lock_holder "$wt")"
+                [ -n "$holder" ] && live=" [worker running, pid ${holder%% *} since ${holder#* }]"
             fi
             echo "  branch $br: $ahead ahead, $behind behind $default_branch$live"
         done
