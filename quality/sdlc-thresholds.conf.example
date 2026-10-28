@@ -1,0 +1,28 @@
+# Per-repo quality gate overrides — copy to <repo-root>/.sdlc-thresholds.conf
+# and commit it to that repo's default branch. Sourced as bash by
+# quality/grade.sh AFTER the project-level quality/thresholds.conf, so only
+# set what differs for this repo.
+#
+# With a branch gate (`ai-sdlc ship` / `ai-sdlc quality <repo> <branch>`) the
+# file is read from the BASE ref (origin's default branch), not the branch's
+# own tree, so a branch can't loosen its own gate. It takes effect once merged.
+#
+# Any variable from quality/thresholds.conf may be set here, plus the scan scope:
+
+# Looser baseline for a repo with generated or legacy code.
+# MAX_CCN=15
+# HARD_MAX_CCN=30
+# MAX_FUNC_LENGTH=120
+# MAX_DUPLICATION_PCT=8
+
+# Extra jscpd ignore globs (comma-separated, appended to the defaults).
+# JSCPD_IGNORE_EXTRA="**/testdata/**,**/fixtures/**,**/*.t.sol"
+
+# Extra lizard excludes (bash array append).
+# LIZARD_EXCLUDE+=(-x "*/generated/*" -x "*/contracts/lib/*")
+
+# Which tracked file extensions are graded (replaces the default list).
+# SOURCE_EXTS="go sol circom ts"
+
+# Score every function in a touched file, not just those the diff touches.
+# LIZARD_DIFF_ONLY=0
