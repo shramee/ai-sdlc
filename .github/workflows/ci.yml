@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: syntax + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          set -e
+          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+          bash -n ai-sdlc
+      - name: shellcheck (warning and above)
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: warning
+          additional_files: ai-sdlc
+
+  quality-smoke:
+    name: quality gate smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install lizard + jscpd
+        run: |
+          pip install lizard
+          npm install -g jscpd
+      - name: grade_smoke.sh
+        run: quality/test/grade_smoke.sh
