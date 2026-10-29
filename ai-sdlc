@@ -267,7 +267,8 @@ ensure_clean_or_stash() {
 
     case "$mode" in
         stash)
-            local msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
+            local msg
+            msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
             git -C "$dir" stash push -u -m "$msg" >/dev/null
             echo "Stashed as: $msg (git -C $dir stash pop to recover)" >&2
             ;;
