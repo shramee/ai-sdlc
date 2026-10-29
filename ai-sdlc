@@ -267,7 +267,8 @@ ensure_clean_or_stash() {
 
     case "$mode" in
         stash)
-            local msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
+            local msg
+            msg="ai-sdlc auto-stash $(date +%Y-%m-%dT%H:%M:%S)"
             git -C "$dir" stash push -u -m "$msg" >/dev/null
             echo "Stashed as: $msg (git -C $dir stash pop to recover)" >&2
             ;;
@@ -479,6 +480,8 @@ $instructions"
 
     local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
     echo $$ > "$pidfile"
+    # Expand now, not when signalled: pidfile is local.
+    # shellcheck disable=SC2064
     trap "rm -f '$pidfile'" EXIT
 
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
