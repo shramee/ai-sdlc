@@ -480,6 +480,8 @@ $instructions"
 
     local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
     echo $$ > "$pidfile"
+    # Expand now, not when signalled: pidfile is local.
+    # shellcheck disable=SC2064
     trap "rm -f '$pidfile'" EXIT
 
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
