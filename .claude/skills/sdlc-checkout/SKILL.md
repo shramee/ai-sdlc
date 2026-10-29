@@ -29,4 +29,5 @@ whatever was committed here.
 
 `ai-sdlc restore <repo>` returns to the default branch. The branch then goes
 through [`sdlc-ship`](../sdlc-ship/SKILL.md)/[`sdlc-review`](../sdlc-review/SKILL.md)
-exactly like a dispatched one.
+exactly like a dispatched one. Shipped without restoring, it is validated in
+the repo's own checkout — which must then be clean, untracked files included.

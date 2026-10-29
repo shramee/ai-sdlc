@@ -13,23 +13,36 @@
 #       Host worktree for <branch> + `opencode run --auto` in it, with
 #       subagent-instructions.md appended. Tracks a GitHub issue
 #       (status:dispatched), best-effort. Worker commits locally; never pushes.
+#       One worker per worktree (locked). Resumes continue the branch's last
+#       opencode session. Exits non-zero unless the run made commits and left
+#       a clean tree; DISPATCH_TIMEOUT caps wall-clock seconds.
 #   vibe <repo> <branch>
 #       Same worktree, interactive opencode session for a human.
 #   review-context <repo> <branch>
 #       Read-only bundle (diff, log, tracked issue, open PR) for the reviewer.
 #   quality <repo> [branch]
 #       quality/grade.sh (lizard + jscpd) grade; thresholds.conf is the gate.
-#   ship [branch]
-#       Host-side (needs `gh`): per agent branch ahead of default, run the
-#       repo's test command AND the quality gate in the branch's worktree;
-#       push + open/update PR only if both green. Failing branches are left
-#       unpushed for a fix-up dispatch (exit 1); tips whose PR was already
-#       closed/merged are skipped.
-#   sync [repo ...]
-#       Pull merged default branches; in submodule projects, stage+commit the
-#       moved pointer in the parent (never pushes it).
+#   ship [--dry-run] [branch]
+#       Host-side (needs `gh`): fetch, then per agent branch ahead of default,
+#       run the repo's test command AND the quality gate in the branch's
+#       worktree; push + open/update PR only if both green. Refuses a branch
+#       with uncommitted/untracked files or a live worker. Failing branches
+#       are left unpushed for a fix-up dispatch (exit 1); tips whose PR was
+#       already closed/merged are skipped. --dry-run prints the plan only.
+#   sync [--delete-merged] [repo ...]
+#       Fast-forward each default branch to origin's without moving what's
+#       checked out; in submodule projects, commit just the moved pointers in
+#       the parent (never pushes). Reports agent branches whose PR merged (per
+#       GitHub); --delete-merged removes those branches and their worktrees.
 #   status
-#       Read-only fleet view: branches, ahead counts, running workers, PRs.
+#       Read-only fleet view: branches, ahead/behind counts, running workers, PRs.
+#   doctor
+#       Read-only health check: tools, gh auth, model, origin/HEAD, CI vs
+#       test_cmd_for drift, stale locks, orphan worktrees, old logs.
+#   prune [--yes] [--days N]
+#       Remove dispatch worktrees whose PR merged (and the branch) or closed
+#       (worktree only), and logs older than N days (PRUNE_LOG_DAYS, 14).
+#       Dry run unless --yes.
 #   checkout <repo> [branch] [--stash|--reset|--wip]
 #       Work a branch directly on the host; no branch = interactive picker.
 #   restore <repo> [--stash|--reset|--wip]
@@ -90,6 +103,10 @@ load_config() {
     # prompt (plus any extra flags passed on the command line); vibe drops it.
     OPENCODE_CMD=(opencode run --auto --format json)
     OPENCODE_MODEL=""
+    # Env wins over the default, the conf file over both.
+    DISPATCH_TIMEOUT="${DISPATCH_TIMEOUT:-}"
+    DISPATCH_RESUME_SESSION="${DISPATCH_RESUME_SESSION:-1}"
+    PRUNE_LOG_DAYS="${PRUNE_LOG_DAYS:-14}"
     AGENT_GIT_NAME=""
     AGENT_GIT_EMAIL=""
     STATE_DIR=""
@@ -128,8 +145,32 @@ require_repo() {
     echo "$dir"
 }
 
+# Local first: origin/HEAD is set by clone (or `git remote set-head origin
+# --auto`). Only when it's unset do we ask the remote — slow, and needs network.
 default_branch_of() {
-    git -C "$1" remote show origin | sed -n '/HEAD branch/s/.*: //p'
+    local dir="$1" ref br
+    if ref="$(git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; then
+        echo "${ref#refs/remotes/origin/}"
+        return 0
+    fi
+    br="$(git -C "$dir" remote show origin 2>/dev/null | sed -n '/HEAD branch/s/.*: //p')"
+    if [ -n "$br" ] && [ "$br" != "(unknown)" ]; then
+        echo "$br"
+        return 0
+    fi
+    for br in main master; do
+        git -C "$dir" show-ref --verify --quiet "refs/remotes/origin/$br" && { echo "$br"; return 0; }
+    done
+    echo "!! can't determine the default branch of $dir — run: git -C $dir remote set-head origin --auto" >&2
+    return 1
+}
+
+# "<behind> <ahead>" of <branch> relative to origin/<default>.
+behind_ahead_of() {
+    local dir="$1" branch="$2" default_branch="$3" counts
+    counts="$(git -C "$dir" rev-list --left-right --count "origin/$default_branch...$branch" 2>/dev/null)" \
+        || counts="0 0"
+    echo "$counts" | awk '{print $1, $2}'
 }
 
 repo_slug_of() {
@@ -307,36 +348,70 @@ open_terminal() {
 
 # ------------------------------------------------------------- gh tracking -
 ensure_status_labels() {
-    local slug="$1"
-    gh label create "status:dispatched" -R "$slug" --color fbca04 --force >/dev/null 2>&1 || true
-    gh label create "status:validating" -R "$slug" --color 0e8a16 --force >/dev/null 2>&1 || true
+    local slug="$1" label color out
+    for label in status:dispatched:fbca04 status:validating:0e8a16; do
+        color="${label##*:}"; label="${label%:*}"
+        out="$(gh label create "$label" -R "$slug" --color "$color" --force 2>&1 >/dev/null)" \
+            || echo "!! couldn't ensure label $label on $slug: $out" >&2
+    done
+    return 0
+}
+
+# Hidden marker in a tracking issue's body; titles get edited, this doesn't.
+issue_marker() { echo "<!-- sdlc-branch: $1 -->"; }
+
+# Tracking issue for <branch>: the one whose body carries its marker, else an
+# exact title match (issues from before the marker); open beats closed.
+# Prints "<number> <STATE>", or nothing if none. Returns 1 when gh fails, so
+# callers can tell "no issue" from "couldn't look" — and don't create a dup.
+issue_for_branch() {
+    local slug="$1" branch="$2" out
+    [ -n "$slug" ] || { echo "!! no GitHub slug for origin — can't look up issues" >&2; return 1; }
+    if ! out="$(gh issue list -R "$slug" --state all -L 500 --json number,title,body,state 2>&1)"; then
+        echo "!! gh issue list failed for $slug: $out" >&2
+        return 1
+    fi
+    jq -r --arg b "$branch" --arg m "$(issue_marker "$branch")" '
+        [.[] | select((.body // "") | contains($m))] + [.[] | select(.title == $b)]
+        | map(select(.state == "OPEN")) + map(select(.state != "OPEN"))
+        | .[0] // empty | "\(.number) \(.state)"' <<<"$out"
 }
 
 issue_number_for_branch() {
-    local slug="$1" branch="$2"
-    gh issue list -R "$slug" --state open --json number,title \
-        --jq ".[] | select(.title == \"$branch\") | .number" 2>/dev/null | head -n1
+    local found; found="$(issue_for_branch "$@")" || return 1
+    echo "${found%% *}"
 }
 
 ensure_issue_for_run() {
-    local slug="$1" branch="$2" prompt="$3"
+    local slug="$1" branch="$2" prompt="$3" found
     ensure_status_labels "$slug"
 
-    local issue_num
-    issue_num="$(issue_number_for_branch "$slug" "$branch")"
+    if ! found="$(issue_for_branch "$slug" "$branch")"; then
+        echo "!! not creating a tracking issue: can't tell whether $branch already has one" >&2
+        return 0
+    fi
 
-    if [ -n "$issue_num" ]; then
-        gh issue comment "$issue_num" -R "$slug" --body "Re-dispatched:
+    local issue_num out
+    if [ -n "$found" ]; then
+        issue_num="${found%% *}"
+        if [ "${found#* }" != OPEN ]; then
+            out="$(gh issue reopen "$issue_num" -R "$slug" 2>&1 >/dev/null)" \
+                || echo "!! couldn't reopen $slug#$issue_num: $out" >&2
+        fi
+        out="$(gh issue comment "$issue_num" -R "$slug" --body "Re-dispatched:
 
-$prompt" >/dev/null 2>&1 || true
-        gh issue edit "$issue_num" -R "$slug" \
-            --remove-label "status:validating" --add-label "status:dispatched" \
-            >/dev/null 2>&1 || true
+$prompt" 2>&1 >/dev/null)" || echo "!! couldn't comment on $slug#$issue_num: $out" >&2
+        out="$(gh issue edit "$issue_num" -R "$slug" \
+            --remove-label "status:validating" --add-label "status:dispatched" 2>&1 >/dev/null)" \
+            || echo "!! couldn't relabel $slug#$issue_num: $out" >&2
     else
-        local url
-        url="$(gh issue create -R "$slug" --title "$branch" --body "$prompt" \
-            --label "status:dispatched" 2>/dev/null)" || true
-        issue_num="$(echo "$url" | sed -E 's#.*/issues/([0-9]+)$#\1#')"
+        if ! out="$(gh issue create -R "$slug" --title "$branch" --label "status:dispatched" --body "$prompt
+
+$(issue_marker "$branch")" 2>&1)"; then
+            echo "!! couldn't create a tracking issue on $slug: $out" >&2
+            return 0
+        fi
+        issue_num="$(echo "$out" | sed -nE 's#.*/issues/([0-9]+)$#\1#p' | tail -n1)"
     fi
 
     echo "$issue_num"
@@ -378,11 +453,83 @@ thresholds_file() {
     fi
 }
 
-# pidfile for the running dispatch, so `status` can tell a live worker from a
-# dead one.
-pidfile_for() { echo "$LOGS_DIR/$1-${2//\//-}.pid"; }
+# ---------------------------------------------------------------- locks ----
+# One worker per worktree. The lock is a mkdir'd dir (atomic on every POSIX fs,
+# no flock on macOS) inside the worktree's own git dir, so it never shows up in
+# `git status`. It holds the owner's PID and start time; a lock whose PID is
+# dead is stale and gets cleared.
+lock_dir_of() {
+    local gd; gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+    echo "$gd/ai-sdlc.lock"
+}
+
+# Prints "<pid> <started>" if a live process holds <worktree>'s lock.
+lock_holder() {
+    local lock pid
+    lock="$(lock_dir_of "$1")" || return 0
+    [ -d "$lock" ] || return 0
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    # mkdir and the pid write aren't atomic together: give a fresh lock a beat.
+    [ -n "$pid" ] || { sleep 1; pid="$(cat "$lock/pid" 2>/dev/null || true)"; }
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        echo "$pid $(cat "$lock/started" 2>/dev/null || echo '?')"
+    fi
+}
+
+acquire_lock() {
+    local wt="$1" lock holder
+    lock="$(lock_dir_of "$wt")" || die "$wt is not a git worktree"
+    if ! mkdir "$lock" 2>/dev/null; then
+        holder="$(lock_holder "$wt")"
+        [ -z "$holder" ] \
+            || die "$wt is locked by a running worker (pid ${holder%% *}, since ${holder#* }) — wait for it or kill it"
+        echo "-- clearing stale lock $lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?') is gone)" >&2
+        rm -rf "$lock"
+        mkdir "$lock" 2>/dev/null || die "could not take lock $lock"
+    fi
+    echo "$$" > "$lock/pid"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$lock/started"
+}
+
+release_lock() {
+    local lock; lock="$(lock_dir_of "$1")" || return 0
+    # Only our own lock: never yank one a later run took over.
+    [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] && rm -rf "$lock"
+    return 0
+}
 
 # ------------------------------------------------------------- dispatch ----
+# Local branches under any of AGENT_BRANCH_PREFIX's space-separated prefixes.
+agent_branches() {
+    local dir="$1" p prefixes
+    read -ra prefixes <<<"$AGENT_BRANCH_PREFIX"
+    for p in "${prefixes[@]}"; do
+        git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$p"
+    done | sort -u
+}
+
+# Branches checked out in dispatch worktrees (under WORKTREES_DIR), whatever
+# their prefix.
+dispatch_worktree_branches() {
+    dispatch_worktrees "$1" | cut -f2 | grep -v '^$' || true
+}
+
+# JSON array of every PR (any state) whose head is <branch>. Fails loudly: a
+# gh error must never read as "no PR".
+prs_for_branch() {
+    local slug="$1" br="$2" out
+    if [ -z "$slug" ]; then
+        echo "!! no GitHub slug for origin — can't look up PRs for $br" >&2
+        return 1
+    fi
+    if ! out="$(gh pr list -R "$slug" --head "$br" --state all -L 50 \
+        --json number,state,headRefOid,url 2>&1)"; then
+        echo "!! gh pr list failed for $slug:$br: $out" >&2
+        return 1
+    fi
+    echo "$out"
+}
+
 # Create (or resume) the worktree at <worktree> for <branch>, branching off
 # origin/<default> when the branch doesn't exist yet.
 ensure_worktree() {
@@ -410,8 +557,51 @@ worktree_of_branch() {
         $0 == "branch " ref { print (n == 1 ? main : wt); exit }'
 }
 
+# Where dispatch remembers a branch's last opencode session id.
+session_file_for() { echo "$LOGS_DIR/$1-${2//\//-}.session"; }
+
+# Runs "$@", killing it after <secs> (empty/0 = no limit) and returning 124,
+# like coreutils timeout — which macOS lacks, so this is a portable watchdog.
+# The command gets its own process group (set -m) so the kill reaches
+# opencode's children too; ^C is forwarded since it's no longer foreground.
+with_timeout() {
+    local secs="$1"; shift
+    if [ -z "$secs" ] || [ "$secs" = 0 ]; then "$@"; return; fi
+    local flag; flag="$(mktemp -t ai-sdlc-timeout.XXXXXX)"; rm -f "$flag"
+    set -m
+    "$@" &
+    local pid=$! wd rc=0
+    set +m
+    # Expand now, not when signalled: pid is local.
+    # shellcheck disable=SC2064
+    trap "kill -TERM -- -$pid 2>/dev/null" INT TERM HUP
+    ( sleep "$secs"; touch "$flag"; kill -TERM -- -"$pid"; sleep 30; kill -KILL -- -"$pid" ) >/dev/null 2>&1 &
+    wd=$!
+    while kill -0 "$pid" 2>/dev/null; do wait "$pid" || rc=$?; done
+    trap - INT TERM HUP
+    pkill -P "$wd" 2>/dev/null || true
+    kill "$wd" 2>/dev/null || true
+    wait "$wd" 2>/dev/null || true
+    if [ -e "$flag" ]; then rm -f "$flag"; return 124; fi
+    return "$rc"
+}
+
+# Resuming a branch whose PR was squash/rebase-merged at this very tip would
+# stack new work on commits main already has under other hashes, and the next
+# ship would re-PR them. A gh failure only warns: dispatch is best-effort here.
+refuse_if_merged() {
+    local dir="$1" br="$2" default_branch="$3" slug="$4" behind ahead prs merged
+    read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
+    [ "$ahead" -gt 0 ] && [ -n "$slug" ] || return 0
+    prs="$(prs_for_branch "$slug" "$br")" || { echo "!! couldn't check $br for a merged PR (continuing)" >&2; return 0; }
+    merged="$(jq -r --arg tip "$(git -C "$dir" rev-parse "$br")" \
+        '[.[] | select(.state == "MERGED" and .headRefOid == $tip)][0].number // empty' <<<"$prs")"
+    [ -z "$merged" ] \
+        || die "$br was already merged (PR #$merged) — dispatch onto a new branch, or clear it with 'ai-sdlc sync --delete-merged'"
+}
+
 # Host-side worktree, so plain git handles staleness/pruning normally.
-# Sets (non-local) WORKTREE, LOG_FILE.
+# Sets (non-local) WORKTREE, LOG_FILE, DEFAULT_BRANCH, RESUMED.
 prepare_worktree() {
     local REPO="$1" BRANCH="$2"
     local dir; dir="$(require_repo "$REPO")" || exit 1
@@ -425,8 +615,20 @@ prepare_worktree() {
     echo "Fetching $REPO" | tee -a "$LOG_FILE"
     git -C "$dir" fetch origin 2>&1 | tee -a "$LOG_FILE"
     local default_branch; default_branch="$(default_branch_of "$dir")"
+    DEFAULT_BRANCH="$default_branch"
+    RESUMED=""
+    git -C "$dir" show-ref --verify --quiet "refs/heads/$BRANCH" && RESUMED=1
 
     ensure_worktree "$dir" "$WORKTREE" "$BRANCH" "$default_branch" 2>&1 | tee -a "$LOG_FILE"
+
+    # A resumed branch is used as-is — never rebased — so say how stale it is.
+    if [ -n "$RESUMED" ]; then
+        local behind ahead
+        read -r behind ahead < <(behind_ahead_of "$dir" "$BRANCH" "$default_branch")
+        echo "Resuming $BRANCH as-is: $ahead ahead, $behind behind origin/$default_branch" | tee -a "$LOG_FILE"
+        [ "$behind" -eq 0 ] \
+            || echo "!! not rebased — if the work depends on newer $default_branch, tell the worker to rebase/merge it" | tee -a "$LOG_FILE"
+    fi
 
     ln -sf "$LOG_FILE" "$WORKTREE/agent.log"
     local gitdir; gitdir="$(git -C "$WORKTREE" rev-parse --git-common-dir)"
@@ -442,8 +644,16 @@ cmd_dispatch() {
     local PROMPT="${3:?$USAGE_LINE}"
     shift 3
 
-    local WORKTREE LOG_FILE
+    local WORKTREE LOG_FILE DEFAULT_BRANCH RESUMED
     prepare_worktree "$REPO" "$BRANCH"
+    acquire_lock "$WORKTREE"
+    # Expand now, not when signalled: WORKTREE is local.
+    # shellcheck disable=SC2064
+    trap "release_lock '$WORKTREE'" EXIT
+
+    local slug
+    slug="$(repo_slug_of "$(repo_dir_of "$REPO")" 2>/dev/null)" || slug=""
+    [ -z "$RESUMED" ] || refuse_if_merged "$(repo_dir_of "$REPO")" "$BRANCH" "$DEFAULT_BRANCH" "$slug"
 
     {
         echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
@@ -453,8 +663,7 @@ cmd_dispatch() {
         echo "---"
     } >> "$LOG_FILE"
 
-    local slug issue_num
-    slug="$(repo_slug_of "$(repo_dir_of "$REPO")" 2>/dev/null)" || slug=""
+    local issue_num
     if [ -n "$slug" ]; then
         issue_num="$(ensure_issue_for_run "$slug" "$BRANCH" "$PROMPT")"
         if [ -n "$issue_num" ]; then
@@ -474,23 +683,39 @@ $instructions"
     # A per-dispatch -m/--model wins over the configured default.
     local model_flags=() arg
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
+    # Re-dispatch continues the branch's last opencode session (its context
+    # survives), unless the caller picked a session or DISPATCH_RESUME_SESSION=0.
+    local session_file session_flags=() own_session=""
+    session_file="$(session_file_for "$(repo_label_of "$REPO")" "$BRANCH")"
     for arg in "$@"; do
-        case "$arg" in -m|--model|--model=*) model_flags=() ;; esac
+        case "$arg" in
+            -m|--model|--model=*) model_flags=() ;;
+            -s|--session|--session=*|-c|--continue|--fork) own_session=1 ;;
+        esac
     done
-
-    local pidfile; pidfile="$(pidfile_for "$(repo_label_of "$REPO")" "$BRANCH")"
-    echo $$ > "$pidfile"
-    # Expand now, not when signalled: pidfile is local.
-    # shellcheck disable=SC2064
-    trap "rm -f '$pidfile'" EXIT
+    if [ -z "$own_session" ] && [ "${DISPATCH_RESUME_SESSION:-1}" != 0 ] && [ -s "$session_file" ]; then
+        session_flags=(--session "$(cat "$session_file")")
+        echo "Continuing opencode session ${session_flags[1]} (DISPATCH_RESUME_SESSION=0 starts fresh)" | tee -a "$LOG_FILE"
+    fi
+    [ -z "${DISPATCH_TIMEOUT:-}" ] || echo "Wall-clock limit: ${DISPATCH_TIMEOUT}s" | tee -a "$LOG_FILE"
 
     # </dev/null: `opencode run` waits for EOF on an inherited non-TTY stdin.
-    local rc=0 log_start
+    local rc=0 log_start start_tip
     log_start="$(wc -l < "$LOG_FILE")"
-    run_worker "$WORKTREE" "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} "$@" -- "$FULL_PROMPT" \
-        </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
+    start_tip="$(git -C "$WORKTREE" rev-parse HEAD)"
+    run_worker "$WORKTREE" with_timeout "${DISPATCH_TIMEOUT:-}" \
+        "${OPENCODE_CMD[@]}" ${model_flags+"${model_flags[@]}"} ${session_flags+"${session_flags[@]}"} "$@" \
+        -- "$FULL_PROMPT" </dev/null 2>&1 | tee -a "$LOG_FILE" || rc=$?
 
     echo "" >> "$LOG_FILE"
+    local session
+    session="$(tail -n +"$((log_start + 1))" "$LOG_FILE" \
+        | grep -o '"sessionID":"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+    if [ -n "$session" ]; then
+        echo "$session" > "$session_file"
+        echo "opencode session: $session" | tee -a "$LOG_FILE"
+    fi
+    [ "$rc" -ne 124 ] || echo "!! worker hit DISPATCH_TIMEOUT (${DISPATCH_TIMEOUT}s) and was killed" | tee -a "$LOG_FILE" >&2
     # opencode reports provider/auth failures as JSON events buried in the
     # stream; surface the last one so a dead run isn't mistaken for a quiet one.
     local err
@@ -500,6 +725,28 @@ $instructions"
         echo "!! worker failed (rc=$rc): ${err:-see $LOG_FILE}" >&2
         [ "$rc" -ne 0 ] || rc=1
     fi
+
+    # Exit 0 isn't success: the work has to be committed on the branch.
+    local commits dirty head
+    commits="$(git -C "$WORKTREE" rev-list --count "$start_tip..$BRANCH")"
+    dirty="$(git -C "$WORKTREE" status --porcelain --untracked-files=all)"
+    head="$(git -C "$WORKTREE" symbolic-ref --quiet --short HEAD || echo "(detached)")"
+    echo "-- run made $commits commit(s) on $BRANCH; tree $([ -n "$dirty" ] && echo dirty || echo clean)" \
+        | tee -a "$LOG_FILE"
+    if [ "$head" != "$BRANCH" ]; then
+        echo "!! the worker left $WORKTREE on $head, not $BRANCH" | tee -a "$LOG_FILE" >&2
+        rc=1
+    fi
+    if [ -n "$dirty" ]; then
+        echo "!! uncommitted changes left in $WORKTREE:" | tee -a "$LOG_FILE" >&2
+        echo "$dirty" | sed 's/^/     /' | tee -a "$LOG_FILE" >&2
+        rc=1
+    fi
+    if [ "$commits" -eq 0 ]; then
+        echo "!! the worker made no commits" | tee -a "$LOG_FILE" >&2
+        [ "$rc" -ne 0 ] || rc=1
+    fi
+    [ "$rc" -eq 0 ] || echo "!! dispatch did not finish cleanly — worktree kept for a resume dispatch: $WORKTREE" >&2
     return "$rc"
 }
 
@@ -511,6 +758,8 @@ cmd_vibe() {
     local WORKTREE LOG_FILE
     prepare_worktree "$REPO" "$BRANCH"
     require_opencode
+    local holder; holder="$(lock_holder "$WORKTREE")"
+    [ -z "$holder" ] || die "a worker (pid ${holder%% *}) is running in $WORKTREE — wait for it first"
 
     local model_flags=()
     [ -n "$OPENCODE_MODEL" ] && model_flags=(--model "$OPENCODE_MODEL")
@@ -540,7 +789,7 @@ cmd_review_context() {
     git -C "$dir" diff "origin/$default_branch...$BRANCH" 2>/dev/null || echo "(diff unavailable)"
     echo '```'
     echo
-    local issue_num; issue_num="$(issue_number_for_branch "$slug" "$BRANCH" 2>/dev/null || true)"
+    local issue_num; issue_num="$(issue_number_for_branch "$slug" "$BRANCH" || true)"
     if [ -n "$issue_num" ]; then
         echo "### tracking issue #$issue_num"
         gh issue view "$issue_num" -R "$slug" --json title,body,comments \
@@ -572,23 +821,50 @@ cmd_quality() {
 
 # ----------------------------------------------------------------- ship ----
 cmd_ship() {
-    local FILTER_BRANCH="${1:-}"
+    local USAGE_LINE="usage: ai-sdlc ship [--dry-run] [branch]"
+    local DRY_RUN="" FILTER_BRANCH="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run|-n) DRY_RUN=1 ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            -*) die "$USAGE_LINE" ;;
+            *) [ -z "$FILTER_BRANCH" ] || die "$USAGE_LINE"; FILTER_BRANCH="$arg" ;;
+        esac
+    done
+    [ -z "$DRY_RUN" ] || echo "(dry run — nothing is created, validated, pushed or opened)"
 
     # Validates in the worktree that has <br> checked out (creating the
     # dispatch one if none does), so the repo's own checkout is never moved —
     # it can't be anyway: git refuses a branch another worktree holds.
+    # Never deletes anything: that worktree may be the user's own checkout.
     ship_one() {
-        local dir="$1" br="$2" default_branch="$3" repo="$4"
+        local dir="$1" br="$2" default_branch="$3" repo="$4" slug="$5" open_pr="$6"
         local wt; wt="$(worktree_of_branch "$dir" "$br")"
         if [ -z "$wt" ]; then
             wt="$WORKTREES_DIR/$(repo_label_of "$repo")/${br//\//-}"
-            mkdir -p "$(dirname "$wt")"
-            ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+            if [ -n "$DRY_RUN" ]; then
+                echo "-- would create worktree $wt"
+            else
+                mkdir -p "$(dirname "$wt")"
+                ensure_worktree "$dir" "$wt" "$br" "$default_branch" || return 1
+            fi
         fi
-        if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no)" ]; then
-            echo "!! $wt has uncommitted changes — commit them (or dispatch a fix-up) first:"
-            git -C "$wt" status --short --untracked-files=no
-            return 1
+        [ "$wt" != "$dir" ] || echo "-- $br is checked out in $repo's own checkout (checkout mode) — validating there"
+
+        if [ -d "$wt" ]; then
+            local holder; holder="$(lock_holder "$wt")"
+            if [ -n "$holder" ]; then
+                echo "!! a worker (pid ${holder%% *}, since ${holder#* }) is still running in $wt — not shipping a moving branch"
+                return 1
+            fi
+            # Untracked files count: tests would pass on files the push omits.
+            local dirty; dirty="$(git -C "$wt" status --porcelain --untracked-files=all)"
+            if [ -n "$dirty" ]; then
+                echo "!! $wt has uncommitted or untracked files — tests would see them, the push wouldn't."
+                echo "   Commit them (dispatch a fix-up), gitignore them, or remove them, then re-ship:"
+                echo "$dirty" | sed 's/^/     /'
+                return 1
+            fi
         fi
 
         local cmd
@@ -597,18 +873,35 @@ cmd_ship() {
             echo "!! no validation command for $repo — define test_cmd_for in $CONFIG_FILE"
             return 1
         fi
+
+        local body
+        body="$(git -C "$dir" log --format='- %s' "origin/$default_branch..$br")"
+        if [ -n "$DRY_RUN" ]; then
+            echo "-- would validate in $wt: $cmd"
+            echo "-- would run the quality gate: grade.sh $wt $br $(thresholds_file)"
+            echo "-- would push $br to origin:"
+            echo "$body" | sed 's/^/     /'
+            if [ -n "$open_pr" ]; then
+                echo "-- would update open PR $open_pr"
+            else
+                echo "-- would open a PR $br -> $default_branch on $slug"
+            fi
+            return 0
+        fi
+
         echo "-- validating in $wt: $cmd"
-        local untracked_before vrc=0
-        untracked_before="$(git -C "$wt" ls-files --others --exclude-standard --directory)"
+        local vrc=0
         (cd "$wt" && eval "$cmd") || vrc=$?
-        # Drop what validation itself left behind (build output, lockfiles) so
-        # a re-dispatched worker's `git add .` can't commit it.
-        comm -13 <(echo "$untracked_before" | sort) \
-            <(git -C "$wt" ls-files --others --exclude-standard --directory | sort) \
-            | while IFS= read -r f; do [ -n "$f" ] && rm -rf "${wt:?}/$f"; done
         if [ "$vrc" -ne 0 ]; then
             echo "!! validation failed for $repo:$br — not pushing"
             return 1
+        fi
+        # Report, never delete, what validation left behind: it isn't in the
+        # push, and the next ship refuses the tree until it's gitignored.
+        local leftovers; leftovers="$(git -C "$wt" status --porcelain --untracked-files=all)"
+        if [ -n "$leftovers" ]; then
+            echo "!! validation left files behind in $wt (not deleted; gitignore or remove them — they block the next ship):"
+            echo "$leftovers" | sed 's/^/     /'
         fi
 
         echo "-- quality gate"
@@ -620,21 +913,20 @@ cmd_ship() {
         echo "-- validation + quality passed, pushing and opening PR"
         git -C "$dir" push -u origin "$br" || return 1
 
-        local slug body
-        slug="$(repo_slug_of "$dir")"
-        body="$(git -C "$dir" log --format='- %s' "origin/$default_branch..$br")"
-
-        local issue_num
-        issue_num="$(issue_number_for_branch "$slug" "$br")"
-        if [ -n "$issue_num" ]; then
+        local issue_num=""
+        if issue_num="$(issue_number_for_branch "$slug" "$br")" && [ -n "$issue_num" ]; then
             body="$body
 
 Closes #$issue_num"
             gh issue edit "$issue_num" -R "$slug" \
-                --remove-label "status:dispatched" --add-label "status:validating" \
-                >/dev/null 2>&1 || true
+                --remove-label "status:dispatched" --add-label "status:validating" >/dev/null \
+                || echo "!! could not relabel $slug#$issue_num (continuing)" >&2
         fi
 
+        if [ -n "$open_pr" ]; then
+            echo "-- pushed; PR already open: $open_pr"
+            return 0
+        fi
         local pr_out
         if ! pr_out="$(gh -R "$slug" pr create --head "$br" --base "$default_branch" \
             --title "$br" --body "$body" 2>&1)"; then
@@ -650,49 +942,75 @@ Closes #$issue_num"
         echo "$pr_out"
     }
 
-    local failed=()
+    local failed=() matched=""
     for repo in "${REPOS[@]}"; do
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
 
+        local branches=() outside=()
+        if [ -n "$FILTER_BRANCH" ]; then
+            git -C "$dir" show-ref --verify --quiet "refs/heads/$FILTER_BRANCH" || continue
+            branches=("$FILTER_BRANCH")
+        else
+            mapfile -t branches < <(agent_branches "$dir")
+            mapfile -t outside < <(dispatch_worktree_branches "$dir" | grep -vxF -f <(agent_branches "$dir"; echo) || true)
+        fi
+        [ "${#outside[@]}" -eq 0 ] \
+            || echo "note: $repo has dispatch worktrees outside AGENT_BRANCH_PREFIX ($AGENT_BRANCH_PREFIX), not shipped: ${outside[*]} — name one explicitly to ship it"
+        [ "${#branches[@]}" -gt 0 ] || continue
+        matched=1
+
+        # Stale origin/<default> skews ahead counts, the PR body and the gate's
+        # diff base: fetch once per repo before looking at anything.
+        if ! git -C "$dir" fetch -q origin; then
+            echo "!! git fetch failed for $repo — skipping it (counts against a stale origin are wrong)"
+            failed+=("$repo")
+            continue
+        fi
         local default_branch slug
-        default_branch="$(default_branch_of "$dir")"
+        default_branch="$(default_branch_of "$dir")" || { failed+=("$repo"); continue; }
         slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
 
-        local branches=()
-        while IFS= read -r line; do branches+=("$line"); done \
-            < <(git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX")
-
-        for br in ${branches+"${branches[@]}"}; do
-            [ -z "$br" ] && continue
-            if [ -n "$FILTER_BRANCH" ] && [ "$br" != "$FILTER_BRANCH" ]; then
+        local br
+        for br in "${branches[@]}"; do
+            [ -n "$br" ] || continue
+            local behind ahead
+            read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
+            if [ "$ahead" -eq 0 ]; then
+                [ -z "$FILTER_BRANCH" ] || echo "skip $repo:$br — nothing ahead of $default_branch"
                 continue
             fi
 
-            local ahead
-            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
-            [ "$ahead" -eq 0 ] && continue
-
             # Squash-merged or rejected branches stay "ahead" forever; a PR
             # already closed/merged at this exact tip means it was decided.
-            local tip decided
+            # A gh failure must not read as "no PR": abort this branch.
+            local tip prs decided open_pr
             tip="$(git -C "$dir" rev-parse "$br")"
-            decided="$(gh -R "$slug" pr list --head "$br" --state all --json number,state,headRefOid \
-                --jq ".[] | select(.headRefOid == \"$tip\" and .state != \"OPEN\") | \"#\(.number) \(.state)\"" \
-                2>/dev/null | head -n1 || true)"
+            if ! prs="$(prs_for_branch "$slug" "$br")"; then
+                echo "!! can't tell whether $repo:$br already has a PR — not shipping it"
+                failed+=("$repo:$br")
+                continue
+            fi
+            decided="$(jq -r --arg tip "$tip" \
+                '[.[] | select(.headRefOid == $tip and .state != "OPEN")][0] // empty | "#\(.number) \(.state)"' <<<"$prs")"
             if [ -n "$decided" ]; then
                 echo "skip $repo:$br — PR $decided at this tip (delete the branch, or add commits to reship)"
                 continue
             fi
+            open_pr="$(jq -r '[.[] | select(.state == "OPEN")][0].url // empty' <<<"$prs")"
 
-            echo "== $repo : $br ($ahead commit(s) ahead of $default_branch) =="
-            if ! ship_one "$dir" "$br" "$default_branch" "$repo"; then
+            echo "== $repo : $br ($ahead ahead, $behind behind $default_branch) =="
+            if ! ship_one "$dir" "$br" "$default_branch" "$repo" "$slug" "$open_pr"; then
                 echo "!! failed for $repo:$br (validate/quality/push/PR) — not proceeding further on this branch"
                 failed+=("$repo:$br")
             fi
         done
     done
 
+    if [ -n "$FILTER_BRANCH" ] && [ -z "$matched" ]; then
+        echo "!! no repo in REPOS has a local branch named $FILTER_BRANCH" >&2
+        return 1
+    fi
     if [ "${#failed[@]}" -gt 0 ]; then
         echo "!! not shipped: ${failed[*]}" >&2
         return 1
@@ -701,51 +1019,152 @@ Closes #$issue_num"
 
 # ----------------------------------------------------------------- sync ----
 cmd_sync() {
-    local repos=("$@")
-    [ "${#repos[@]}" -eq 0 ] && repos=("${REPOS[@]}")
+    local USAGE_LINE="usage: ai-sdlc sync [--delete-merged] [repo ...]"
+    local repos=() DELETE_MERGED="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --delete-merged) DELETE_MERGED=1 ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            -*) die "$USAGE_LINE" ;;
+            *) repos+=("$arg") ;;
+        esac
+    done
+    [ "${#repos[@]}" -gt 0 ] || repos=("${REPOS[@]}")
 
-    sync_one() {
-        local dir="$1" default_branch="$2"
-        git -C "$dir" checkout "$default_branch"
-        git -C "$dir" pull --ff-only origin "$default_branch"
-    }
-
-    local updated=()
-
+    local updated=() shas=() failed=()
     for repo in "${repos[@]}"; do
         local dir; dir="$(repo_dir_of "$repo")"
         [ -e "$dir/.git" ] || { echo "skip $repo (not initialized)"; continue; }
 
-        local default_branch orig_branch before after
-        default_branch="$(default_branch_of "$dir")"
-        orig_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
-        before="$(git -C "$dir" rev-parse HEAD)"
-
-        if ! sync_one "$dir" "$default_branch"; then
-            echo "!! sync failed for $repo — skipping"
-            git -C "$dir" checkout "$orig_branch" || echo "!! could not restore $repo to $orig_branch"
-            continue
+        if ! git -C "$dir" fetch -q origin; then
+            echo "!! git fetch failed for $repo — skipping"
+            failed+=("$repo"); continue
+        fi
+        local default_branch
+        default_branch="$(default_branch_of "$dir")" || { failed+=("$repo"); continue; }
+        if ! advance_default_branch "$dir" "$default_branch" "$repo"; then
+            failed+=("$repo"); continue
         fi
 
-        after="$(git -C "$dir" rev-parse HEAD)"
-        if [ "$before" != "$after" ]; then
-            echo "$repo: $before -> $after"
-            if project_is_superrepo && [ "$repo" != "." ]; then
-                git -C "$PROJECT_ROOT" add "$repo"
-                updated+=("$repo")
+        if project_is_superrepo && [ "$repo" != "." ]; then
+            local recorded new
+            recorded="$(git -C "$PROJECT_ROOT" rev-parse --verify --quiet "HEAD:$repo" || true)"
+            new="$(git -C "$dir" rev-parse "refs/heads/$default_branch")"
+            if [ "$recorded" != "$new" ]; then
+                echo "$repo: pointer ${recorded:0:12} -> ${new:0:12}"
+                updated+=("$repo"); shas+=("$new")
             fi
         fi
+
+        report_merged_branches "$dir" "$repo" "$default_branch"
     done
 
     if [ "${#updated[@]}" -eq 0 ]; then
         echo "No parent-repo pointers to update."
-        return 0
+    else
+        commit_pointers "chore: sync ${updated[*]} to latest upstream" updated shas
+        echo "Committed parent repo update for: ${updated[*]}"
+        echo "Review with 'git show', then push manually when ready."
     fi
+    if [ "${#failed[@]}" -gt 0 ]; then
+        echo "!! not synced: ${failed[*]}" >&2
+        return 1
+    fi
+}
 
-    # Pathspec: commit only the moved pointers, not whatever else is staged.
-    git -C "$PROJECT_ROOT" commit -m "chore: sync ${updated[*]} to latest upstream" -- "${updated[@]}"
-    echo "Committed parent repo update for: ${updated[*]}"
-    echo "Review with 'git show', then push manually when ready."
+# Fast-forward <default> to origin's without moving whatever <dir> has checked
+# out: a checkout-mode branch or a detached submodule stays exactly where it is.
+advance_default_branch() {
+    local dir="$1" default_branch="$2" repo="$3" wt cur
+    wt="$(worktree_of_branch "$dir" "$default_branch")"
+    if [ -n "$wt" ]; then
+        # Checked out somewhere: update it there, so index and tree follow.
+        git -C "$wt" merge --ff-only -q "origin/$default_branch" && return 0
+        echo "!! $repo: $default_branch in $wt can't fast-forward (diverged, or local changes in the way) — skipping"
+        return 1
+    fi
+    local before; before="$(git -C "$dir" rev-parse --verify --quiet "refs/heads/$default_branch" || true)"
+    [ "$before" != "$(git -C "$dir" rev-parse "origin/$default_branch")" ] || return 0
+    if [ -n "$before" ]; then
+        if ! git -C "$dir" merge-base --is-ancestor "$default_branch" "origin/$default_branch"; then
+            echo "!! $repo: local $default_branch has diverged from origin — skipping"
+            return 1
+        fi
+        git -C "$dir" update-ref "refs/heads/$default_branch" "origin/$default_branch"
+    else
+        git -C "$dir" branch -q --track "$default_branch" "origin/$default_branch"
+    fi
+    cur="$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "detached HEAD")"
+    echo "$repo: advanced $default_branch to origin's; left the checkout on $cur"
+}
+
+# Commit exactly these submodule pointers (names/shas: array variable names)
+# with plumbing: `git commit -- <path>` would re-read each submodule's HEAD,
+# which isn't the default branch when the submodule is on something else.
+commit_pointers() {
+    local msg="$1"; local -n _paths="$2" _shas="$3"
+    local tmp_index tree commit old i
+    tmp_index="$(mktemp -t ai-sdlc-index.XXXXXX)"; rm -f "$tmp_index"
+    old="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+    GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" read-tree "$old"
+    for i in "${!_paths[@]}"; do
+        GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" update-index --cacheinfo "160000,${_shas[$i]},${_paths[$i]}"
+    done
+    tree="$(GIT_INDEX_FILE="$tmp_index" git -C "$PROJECT_ROOT" write-tree)"
+    rm -f "$tmp_index"
+    commit="$(git -C "$PROJECT_ROOT" commit-tree "$tree" -p "$old" -m "$msg")"
+    git -C "$PROJECT_ROOT" update-ref -m "ai-sdlc sync" HEAD "$commit" "$old"
+    # Keep the real index in step for these paths; anything else staged stays staged.
+    for i in "${!_paths[@]}"; do
+        git -C "$PROJECT_ROOT" update-index --cacheinfo "160000,${_shas[$i]},${_paths[$i]}"
+    done
+}
+
+# Which agent branches' PRs merged — checked on GitHub, not guessed from
+# ancestry (squash/rebase merges never look merged locally). With
+# --delete-merged, drops each such branch and its dispatch worktree.
+report_merged_branches() {
+    local dir="$1" repo="$2" default_branch="$3" slug br
+    slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
+    while IFS= read -r br; do
+        [ -n "$br" ] && [ "$br" != "$default_branch" ] || continue
+        local prs merged num oid tip
+        prs="$(prs_for_branch "$slug" "$br")" || { echo "!! $repo:$br: PR state unknown — leaving it alone"; continue; }
+        merged="$(jq -r '[.[] | select(.state == "MERGED")][0] // empty | "\(.number) \(.headRefOid)"' <<<"$prs")"
+        [ -n "$merged" ] || continue
+        num="${merged%% *}"; oid="${merged#* }"
+        tip="$(git -C "$dir" rev-parse "$br")"
+        if [ "$tip" != "$oid" ] && ! git -C "$dir" merge-base --is-ancestor "$tip" "origin/$default_branch"; then
+            echo "$repo:$br: PR #$num merged, but the branch has commits since — keeping it"
+            continue
+        fi
+        if [ -z "$DELETE_MERGED" ]; then
+            echo "$repo:$br: merged (PR #$num) — 'ai-sdlc sync --delete-merged' removes it and its worktree"
+        else
+            delete_branch_and_worktree "$dir" "$repo" "$br" && echo "$repo:$br: merged (PR #$num) — deleted branch and worktree"
+        fi
+    done < <({ agent_branches "$dir"; dispatch_worktree_branches "$dir"; } | sort -u)
+}
+
+# Never touches the repo's own checkout, a locked worktree, or a dirty one.
+delete_branch_and_worktree() {
+    local dir="$1" repo="$2" br="$3" wt holder
+    wt="$(worktree_of_branch "$dir" "$br")"
+    if [ "$wt" = "$dir" ]; then
+        echo "!! $repo:$br is checked out in $repo's own checkout — restore it first; not deleting"
+        return 1
+    fi
+    if [ -n "$wt" ]; then
+        holder="$(lock_holder "$wt")"
+        [ -z "$holder" ] || { echo "!! $repo:$br: a worker (pid ${holder%% *}) is running in $wt — not deleting"; return 1; }
+        if [ -n "$(git -C "$wt" status --porcelain --untracked-files=all)" ]; then
+            echo "!! $repo:$br: $wt has uncommitted/untracked files — not deleting"
+            return 1
+        fi
+        git -C "$dir" worktree remove "$wt" || return 1
+    fi
+    git -C "$dir" branch -q -D "$br" || return 1
+    rm -f "$(session_file_for "$(repo_label_of "$repo")" "$br")"
 }
 
 # ------------------------------------------------------------- checkout ----
@@ -800,24 +1219,24 @@ cmd_status() {
         [ -e "$dir/.git" ] || { echo "== $repo: not initialized =="; continue; }
 
         local default_branch cur dirty
-        default_branch="$(default_branch_of "$dir")"
+        default_branch="$(default_branch_of "$dir")" || { echo "== $repo: unknown default branch =="; continue; }
         cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
         dirty="$(git -C "$dir" status --porcelain | wc -l | tr -d ' ')"
 
         echo "== $repo (on $cur, default $default_branch, $dirty dirty file(s)) =="
 
-        git -C "$dir" for-each-ref --format='%(refname:short)' "refs/heads/$AGENT_BRANCH_PREFIX" | while read -r br; do
+        # Agent branches plus anything a dispatch worktree holds, whatever its prefix.
+        { agent_branches "$dir"; dispatch_worktree_branches "$dir"; } | sort -u | while read -r br; do
             [ -z "$br" ] && continue
-            local ahead
-            ahead="$(git -C "$dir" rev-list --count "origin/$default_branch..$br" 2>/dev/null || echo 0)"
-            local label; label="$(repo_label_of "$repo")"
-            local wt="$WORKTREES_DIR/$label/${br//\//-}"
-            local live="" pid
-            if [ -d "$wt" ]; then
-                pid="$(cat "$(pidfile_for "$label" "$br")" 2>/dev/null || true)"
-                [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && live=" [worker running, pid $pid]"
+            local behind ahead
+            read -r behind ahead < <(behind_ahead_of "$dir" "$br" "$default_branch")
+            local wt live="" holder
+            wt="$(worktree_of_branch "$dir" "$br")"
+            if [ -n "$wt" ]; then
+                holder="$(lock_holder "$wt")"
+                [ -n "$holder" ] && live=" [worker running, pid ${holder%% *} since ${holder#* }]"
             fi
-            echo "  branch $br: $ahead commit(s) ahead of $default_branch$live"
+            echo "  branch $br: $ahead ahead, $behind behind $default_branch$live"
         done
 
         local slug
@@ -827,6 +1246,263 @@ cmd_status() {
             --template '{{range .}}  PR #{{.number}} [{{.state}}] {{.headRefName}}: {{.title}}
 {{end}}' 2>/dev/null || echo "  (could not list PRs)"
     done
+}
+
+# --------------------------------------------------------------- doctor ----
+# Every registered worktree of <dir> under WORKTREES_DIR, as "<path>\t<branch>"
+# (branch empty when detached).
+dispatch_worktrees() {
+    local root; root="$(cd -P "$WORKTREES_DIR" 2>/dev/null && pwd)" || return 0
+    git -C "$1" worktree list --porcelain | awk -v root="$root/" '
+        function flush() { if (wt != "" && index(wt, root) == 1) print wt "\t" br; wt = ""; br = "" }
+        /^worktree / { flush(); wt = substr($0, 10) }
+        /^branch refs\/heads\// { br = substr($0, 19) }
+        END { flush() }'
+}
+
+# One command per line from a test_cmd_for string or workflow `run:` lines:
+# split on && ; ||, drop setup noise (cd, echo, git, ...), and spell
+# `pnpm run x` as `pnpm x` so equivalent invocations compare equal.
+normalize_cmds() {
+    awk '{
+        n = split($0, parts, /&&|;|\|\|/)
+        for (i = 1; i <= n; i++) {
+            s = parts[i]
+            gsub(/^[ \t"'\'']+|[ \t"'\'']+$/, "", s); gsub(/[ \t]+/, " ", s)
+            if (s == "" || s ~ /^#/) continue
+            split(s, w, " ")
+            if (w[1] ~ /^(cd|echo|export|mkdir|ls|cat|set|curl|wget|sudo|apt|apt-get|brew|git|cp|mv|rm|chmod|source|printf|tee|true|\.)$/) continue
+            if ((w[1] == "pnpm" || w[1] == "yarn") && w[2] == "run") sub(/ run /, " ", s)
+            if (w[1] == "npm" && w[2] == "run" && w[3] == "test") s = "npm test"
+            print s
+        }
+    }'
+}
+
+# The `run:` commands of a GitHub Actions workflow, block scalars included.
+workflow_run_cmds() {
+    awk '
+        function emit(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); if (s != "") print s }
+        inblock {
+            match($0, /^ */)
+            if ($0 ~ /^[ \t]*$/ || RLENGTH > bindent) { emit($0); next }
+            inblock = 0
+        }
+        /^[ \t]*(- )?run:[ \t]*/ {
+            line = $0; sub(/^[ \t]*(- )?run:[ \t]*/, "", line)
+            if (line ~ /^[|>][-+]?[ \t]*$/) { match($0, /^ */); bindent = RLENGTH; inblock = 1 }
+            else emit(line)
+        }' "$1"
+}
+
+# Warn when CI runs a command ship's test_cmd_for doesn't — ship would go green
+# over a red PR. A heuristic over normalised strings; warnings only.
+ci_drift() {
+    local dir="$1" cmd="$2" wf line key closest local_cmds
+    local_cmds="$(normalize_cmds <<<"$cmd")"
+    for wf in "$dir"/.github/workflows/*.yml "$dir"/.github/workflows/*.yaml; do
+        [ -f "$wf" ] || continue
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" <<<"$local_cmds" && continue
+            key="$(awk '{ print ($2 == "run" || $2 == "exec" || $2 == "x") ? $1 " " $2 " " $3 : $1 " " $2 }' <<<"$line")"
+            closest="$(grep -F -- "$key" <<<"$local_cmds" | head -n1 || true)"
+            if [ -n "$closest" ]; then
+                doctor_warn "CI drift ($(basename "$wf")): CI runs \`$line\`, ship runs \`$closest\`"
+            else
+                doctor_warn "CI drift ($(basename "$wf")): CI runs \`$line\`, ship's test_cmd_for doesn't"
+            fi
+        done < <(workflow_run_cmds "$wf" | normalize_cmds | awk '!seen[$0]++')
+    done
+}
+
+doctor_ok()   { echo "  ok    $*"; }
+doctor_warn() { echo "  warn  $*"; DOCTOR_WARNS=$((DOCTOR_WARNS + 1)); }
+doctor_fail() { echo "  FAIL  $*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
+
+cmd_doctor() {
+    DOCTOR_WARNS=0 DOCTOR_FAILS=0
+    local t
+
+    echo "== tools"
+    for t in git jq python3; do
+        command -v "$t" >/dev/null 2>&1 && doctor_ok "$t" || doctor_fail "$t not on PATH"
+    done
+    for t in lizard jscpd; do
+        command -v "$t" >/dev/null 2>&1 && doctor_ok "$t" || doctor_fail "$t not on PATH — ship's quality gate needs it"
+    done
+    if command -v "${OPENCODE_CMD[0]}" >/dev/null 2>&1; then
+        doctor_ok "${OPENCODE_CMD[0]} ($(command -v "${OPENCODE_CMD[0]}"))"
+    else
+        doctor_fail "${OPENCODE_CMD[0]} not on PATH — dispatch can't run workers"
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+        doctor_fail "gh not on PATH — ship/sync/issue tracking need it"
+    elif gh auth status >/dev/null 2>&1; then
+        doctor_ok "gh (authenticated)"
+    else
+        doctor_fail "gh is not authenticated — run: gh auth login"
+    fi
+
+    echo "== config ($CONFIG_FILE)"
+    local a model=""
+    [ -n "$OPENCODE_MODEL" ] && model="$OPENCODE_MODEL"
+    for a in "${OPENCODE_CMD[@]}"; do case "$a" in -m|--model|--model=*) model="(in OPENCODE_CMD)" ;; esac; done
+    if [ -n "$model" ]; then doctor_ok "model: $model"
+    else doctor_warn "no model pinned — opencode's default applies (set OPENCODE_MODEL, or pass -m per dispatch)"; fi
+    [ -f "$SUBAGENT_INSTRUCTIONS" ] && doctor_ok "instructions: $SUBAGENT_INSTRUCTIONS" \
+        || doctor_warn "SUBAGENT_INSTRUCTIONS missing: $SUBAGENT_INSTRUCTIONS"
+    if [ -n "$DISPATCH_TIMEOUT" ] && ! [[ "$DISPATCH_TIMEOUT" =~ ^[0-9]+$ ]]; then
+        doctor_fail "DISPATCH_TIMEOUT must be whole seconds, got: $DISPATCH_TIMEOUT"
+    fi
+
+    local repo labels=()
+    for repo in "${REPOS[@]}"; do
+        labels+=("$(repo_label_of "$repo")")
+        local dir; dir="$(repo_dir_of "$repo")"
+        echo "== $repo"
+        [ -e "$dir/.git" ] || { doctor_fail "not initialized: $dir"; continue; }
+
+        git -C "$dir" symbolic-ref --quiet refs/remotes/origin/HEAD >/dev/null \
+            || doctor_warn "origin/HEAD unset — every default-branch lookup hits the network; run: git -C $dir remote set-head origin --auto"
+        local default_branch; default_branch="$(default_branch_of "$dir" 2>/dev/null)" \
+            || { doctor_fail "can't determine the default branch"; continue; }
+
+        local cmd; cmd="$(validation_cmd_for "$repo" "$dir")"
+        if [ -z "$cmd" ]; then doctor_fail "no validation command — define test_cmd_for"
+        else ci_drift "$dir" "$cmd"; fi
+
+        local cur; cur="$(git -C "$dir" symbolic-ref --quiet --short HEAD || echo "")"
+        if [ -n "$cur" ] && [ "$cur" != "$default_branch" ]; then
+            doctor_warn "own checkout is on $cur, not $default_branch (checkout mode? 'ai-sdlc restore $repo')"
+            [ ! -e "$WORKTREES_DIR/$(repo_label_of "$repo")/${cur//\//-}" ] \
+                || doctor_warn "$cur also has a dispatch worktree dir, but the branch is held by the own checkout — dispatch on it will fail"
+        fi
+
+        local wt br holder lock
+        while IFS=$'\t' read -r wt br; do
+            [ -n "$wt" ] || continue
+            if [ -z "$br" ]; then doctor_warn "worktree $wt is on a detached HEAD"; continue; fi
+            lock="$(lock_dir_of "$wt" 2>/dev/null || true)"
+            if [ -n "$lock" ] && [ -d "$lock" ]; then
+                holder="$(lock_holder "$wt")"
+                if [ -n "$holder" ]; then doctor_ok "$br: worker running (pid ${holder%% *})"
+                else doctor_warn "$br: stale lock (pid $(cat "$lock/pid" 2>/dev/null || echo '?') is gone) — cleared on next dispatch, or rm -r $lock"; fi
+            fi
+            agent_branches "$dir" | grep -qxF -- "$br" \
+                || doctor_warn "$br has a dispatch worktree but no AGENT_BRANCH_PREFIX ($AGENT_BRANCH_PREFIX) matches — bare 'ship' skips it"
+        done < <(dispatch_worktrees "$dir")
+        git -C "$dir" worktree list --porcelain | grep -q '^prunable' \
+            && doctor_warn "git has prunable worktree entries — run: git -C $dir worktree prune"
+    done
+
+    echo "== state ($STATE_DIR)"
+    local d sub
+    if [ -d "$WORKTREES_DIR" ]; then
+        for d in "$WORKTREES_DIR"/*/; do
+            [ -d "$d" ] || continue
+            d="${d%/}"
+            if ! printf '%s\n' "${labels[@]}" | grep -qxF -- "$(basename "$d")"; then
+                doctor_warn "orphan: $d — no repo in REPOS has label $(basename "$d")"
+                continue
+            fi
+            for sub in "$d"/*/; do
+                [ -d "$sub" ] || continue
+                [ -e "$sub/.git" ] && git -C "$sub" rev-parse --git-dir >/dev/null 2>&1 \
+                    || doctor_warn "orphan: ${sub%/} is not a git worktree any more"
+            done
+        done
+        doctor_ok "worktrees: $(du -sh "$WORKTREES_DIR" 2>/dev/null | cut -f1)"
+    fi
+    if [ -d "$LOGS_DIR" ]; then
+        local old pids
+        old="$(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.log' -mtime +"$PRUNE_LOG_DAYS" | wc -l | tr -d ' ')"
+        pids="$(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.pid' | wc -l | tr -d ' ')"
+        doctor_ok "logs: $(find "$LOGS_DIR" -maxdepth 1 -type f -name '*.log' | wc -l | tr -d ' ') ($(du -sh "$LOGS_DIR" 2>/dev/null | cut -f1))"
+        [ "$old" -eq 0 ] || doctor_warn "$old log(s) older than ${PRUNE_LOG_DAYS}d — 'ai-sdlc prune'"
+        [ "$pids" -eq 0 ] || doctor_warn "$pids leftover .pid file(s) from before worktree locks — 'ai-sdlc prune'"
+    fi
+
+    echo "doctor: $DOCTOR_FAILS failure(s), $DOCTOR_WARNS warning(s)"
+    [ "$DOCTOR_FAILS" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- prune ----
+cmd_prune() {
+    local USAGE_LINE="usage: ai-sdlc prune [--yes] [--days N]"
+    local APPLY="" days="$PRUNE_LOG_DAYS"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y) APPLY=1 ;;
+            --days) days="${2:?$USAGE_LINE}"; shift ;;
+            -h|--help) echo "$USAGE_LINE"; return 0 ;;
+            *) die "$USAGE_LINE" ;;
+        esac
+        shift
+    done
+    [[ "$days" =~ ^[0-9]+$ ]] || die "--days wants a whole number, got: $days"
+    [ -n "$APPLY" ] || echo "(dry run — pass --yes to apply)"
+
+    local repo in_use=()
+    for repo in "${REPOS[@]}"; do
+        local dir; dir="$(repo_dir_of "$repo")"
+        [ -e "$dir/.git" ] || continue
+        local slug default_branch
+        slug="$(repo_slug_of "$dir" 2>/dev/null || true)"
+        default_branch="$(default_branch_of "$dir")" || continue
+
+        local wt br
+        while IFS=$'\t' read -r wt br; do
+            [ -n "$wt" ] || continue
+            in_use+=("$(basename "$(readlink "$wt/agent.log" 2>/dev/null || echo none)" .log)")
+            [ -n "$br" ] || { echo "keep $wt — detached HEAD, decide by hand"; continue; }
+            local prs decided state num oid tip
+            prs="$(prs_for_branch "$slug" "$br")" || { echo "keep $repo:$br — PR state unknown"; continue; }
+            # Any open PR keeps it; otherwise the newest decided one rules.
+            [ -z "$(jq -r '.[] | select(.state == "OPEN") | .number' <<<"$prs")" ] || continue
+            decided="$(jq -r '[.[] | select(.state != "OPEN")][0] // empty | "\(.state) \(.number) \(.headRefOid)"' <<<"$prs")"
+            [ -n "$decided" ] || continue
+            read -r state num oid <<<"$decided"
+            tip="$(git -C "$dir" rev-parse "$br")"
+            if [ "$tip" != "$oid" ] && ! git -C "$dir" merge-base --is-ancestor "$tip" "origin/$default_branch"; then
+                echo "keep $repo:$br — PR #$num $state, but the branch has commits since"
+                continue
+            fi
+            local what="worktree $wt"
+            [ "$state" = MERGED ] && what="branch $br + $what" || what="$what (branch kept: PR was closed unmerged)"
+            if [ -z "$APPLY" ]; then
+                echo "would remove $repo: $what — PR #$num $state"
+            elif [ "$state" = MERGED ]; then
+                delete_branch_and_worktree "$dir" "$repo" "$br" && echo "removed $repo: $what"
+            else
+                prune_worktree "$dir" "$repo" "$br" "$wt" && echo "removed $repo: $what"
+            fi
+        done < <(dispatch_worktrees "$dir")
+        [ -z "$APPLY" ] || git -C "$dir" worktree prune
+    done
+
+    [ -d "$LOGS_DIR" ] || return 0
+    local f stem
+    while IFS= read -r f; do
+        stem="$(basename "$f")"; stem="${stem%.*}"
+        printf '%s\n' ${in_use+"${in_use[@]}"} | grep -qxF -- "$stem" && continue
+        if [ -n "$APPLY" ]; then rm -f "$f" && echo "removed $f"
+        else echo "would remove $f"; fi
+    done < <(find "$LOGS_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.session' -o -name '*.pid' \) \
+        \( -mtime +"$days" -o -name '*.pid' \) | sort)
+}
+
+# Remove one dispatch worktree, keeping its branch. Same refusals as
+# delete_branch_and_worktree.
+prune_worktree() {
+    local dir="$1" repo="$2" br="$3" wt="$4" holder
+    holder="$(lock_holder "$wt")"
+    [ -z "$holder" ] || { echo "!! $repo:$br: a worker (pid ${holder%% *}) is running — keeping"; return 1; }
+    if [ -n "$(git -C "$wt" status --porcelain --untracked-files=all)" ]; then
+        echo "!! $repo:$br: $wt has uncommitted/untracked files — keeping"
+        return 1
+    fi
+    git -C "$dir" worktree remove "$wt"
 }
 
 # --------------------------------------------------------------- config ----
@@ -880,6 +1556,8 @@ case "$SUBCOMMAND" in
     ship)           cmd_ship "$@" ;;
     sync)           cmd_sync "$@" ;;
     status)         cmd_status "$@" ;;
+    doctor)         cmd_doctor "$@" ;;
+    prune)          cmd_prune "$@" ;;
     checkout)       cmd_checkout "$@" ;;
     restore)        cmd_restore "$@" ;;
     config)         cmd_config "$@" ;;

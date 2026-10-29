@@ -13,9 +13,11 @@
 # monorepo-of-repos. Default: (.)
 REPOS=(.)
 
-# Branch prefix that marks a branch as agent work — `ship` and `status` only
-# ever look at branches under it. Default: "agent/"
-# AGENT_BRANCH_PREFIX="agent/"
+# Branch prefixes that mark a branch as agent work, space-separated. A bare
+# `ship` considers only branches under one of them (`ship <branch>` ships any
+# local branch); `status` lists them plus whatever a dispatch worktree holds.
+# Default: "agent/"
+# AGENT_BRANCH_PREFIX="agent/ fix/ feat/"
 
 # The opencode invocation, as an argv array (before the repo/model flags
 # `dispatch` appends). Default: (opencode run --auto --format json)
@@ -25,10 +27,22 @@ REPOS=(.)
 # use opencode's own default/configured model.
 # OPENCODE_MODEL="anthropic/claude-sonnet-5"
 
+# Wall-clock cap for one dispatch, in seconds; the worker is killed (TERM,
+# then KILL 30s later) and dispatch exits 124. Empty = no limit.
+# DISPATCH_TIMEOUT=7200
+
+# A re-dispatch on a branch continues that branch's last opencode session
+# (`--session <id>`, recorded in the logs dir). 0 = always start fresh.
+# Passing -s/--session/-c/--continue/--fork to dispatch overrides it.
+# DISPATCH_RESUME_SESSION=1
+
 # Commit identity for dispatched workers. Passed as GIT_AUTHOR_*/GIT_COMMITTER_*
 # env vars to the worker process only — never touches the host's git config.
 # AGENT_GIT_NAME="myproject-bot"
 # AGENT_GIT_EMAIL="bot@users.noreply.github.com"
+
+# `ai-sdlc prune` removes logs older than this many days. Default: 14
+# PRUNE_LOG_DAYS=14
 
 # Where logs and host-side worktrees live. Default: <project>/.sdlc/{logs,worktrees}
 # STATE_DIR=".sdlc"

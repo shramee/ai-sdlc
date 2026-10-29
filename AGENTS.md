@@ -23,7 +23,8 @@ Fresh work follows this order; jump to your stage when resuming:
 
 Anytime: [`sdlc-status`](.claude/skills/sdlc-status/SKILL.md) (fleet view)
 and [`sdlc-checkout`](.claude/skills/sdlc-checkout/SKILL.md) (sanctioned
-direct-edit exception).
+direct-edit exception). `ai-sdlc doctor` when something looks off;
+`ai-sdlc prune` (dry run, `--yes` to apply) to clear merged worktrees and old logs.
 
 ## Division of labor
 
@@ -38,8 +39,10 @@ direct-edit exception).
 
 ## This repo itself
 
-* `bash -n ai-sdlc` after every `ai-sdlc` edit; `ai-sdlc config` in a consuming
-  project is the end-to-end smoke test.
+* `bash -n ai-sdlc` after every `ai-sdlc` edit; `ai-sdlc config` and
+  `ai-sdlc doctor` in a consuming project are the end-to-end smoke test.
+  Exercise dispatch/ship/sync on a throwaway superrepo with a local bare
+  remote and a stub `OPENCODE_CMD`, never on a real project.
 * Nothing project-specific in `ai-sdlc` — everything comes from `sdlc.conf` with
   a default; project-specific needs a new config knob.
 * `quality/grade.sh . "" quality/thresholds.conf` stays green here.
